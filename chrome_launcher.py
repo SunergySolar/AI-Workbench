@@ -66,7 +66,7 @@ def start_chrome(
         log.debug("chrome_launcher.start_chrome: launching headless")
     else:
         log.debug("chrome_launcher.start_chrome: launching visible")
-    args.append(target_url)
+    args += ["--new-window", target_url]
     return subprocess.Popen(args, stderr=subprocess.DEVNULL)
 
 
