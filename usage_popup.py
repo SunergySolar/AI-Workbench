@@ -38,7 +38,11 @@ class UsagePopup:
     GREEN = "#50d490"
 
     def __init__(
-        self, console_available: bool = False, on_link_browser=None, on_go_headless=None, on_go_visible=None
+        self,
+        console_available: bool = False,
+        on_link_browser=None,
+        on_go_headless=None,
+        on_go_visible=None,
     ):
         log.debug(
             "Starting UsagePopup.__init__ console_available=%s", console_available
@@ -534,7 +538,7 @@ class UsagePopup:
         active = llm_backend.is_local_llm_active()
         self._vars["llm_status"] = tk.StringVar(
             value=(
-                f"Alt LLM ({config.LLM_URL})" if active else "Active: Claude API"
+                f"Active: LLM ({config.LLM_URL})" if active else "Active: Claude API"
             )
         )
         self._llm_active = active
@@ -576,7 +580,7 @@ class UsagePopup:
             else:
                 llm_backend.activate_local_llm()
                 self._llm_active = True
-                self._vars["llm_status"].set(f"Alt LLM ({config.LLM_URL})")
+                self._vars["llm_status"].set(f"Active: LLM ({config.LLM_URL})")
                 status_lbl.config(fg="#50d490")
                 toggle_btn.config(text="Switch to Claude API")
 
@@ -585,7 +589,11 @@ class UsagePopup:
         # ── Server launch / stop ──────────────────────────────────────────────
 
         self._vars["server_status"] = tk.StringVar(
-            value="Server: running" if llm_backend.is_server_running() else "Server: stopped"
+            value=(
+                "Server: running"
+                if llm_backend.is_server_running()
+                else "Server: stopped"
+            )
         )
         server_status_lbl = tk.Label(
             parent,
@@ -634,7 +642,9 @@ class UsagePopup:
             "LLMLog.Vertical.TScrollbar",
             background=[("active", "#6060a0"), ("!active", "#44445a")],
         )
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", style="LLMLog.Vertical.TScrollbar")
+        scrollbar = ttk.Scrollbar(
+            log_frame, orient="vertical", style="LLMLog.Vertical.TScrollbar"
+        )
         self._server_log = tk.Text(
             log_frame,
             height=6,
@@ -659,7 +669,10 @@ class UsagePopup:
         def _do_append(line: str):
             self._server_log.config(state="normal")
             self._server_log.insert("end", line + "\n")
-            if int(self._server_log.index("end-1c").split(".")[0]) > config.LLM_LOG_MAX_LINES:
+            if (
+                int(self._server_log.index("end-1c").split(".")[0])
+                > config.LLM_LOG_MAX_LINES
+            ):
                 self._server_log.delete("1.0", "2.0")
             self._server_log.see("end")
             self._server_log.config(state="disabled")
