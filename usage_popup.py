@@ -534,7 +534,7 @@ class UsagePopup:
         active = llm_backend.is_local_llm_active()
         self._vars["llm_status"] = tk.StringVar(
             value=(
-                "Active: Local LLM  (localhost:8001)" if active else "Active: Claude API"
+                f"Alt LLM ({config.LLM_URL})" if active else "Active: Claude API"
             )
         )
         self._llm_active = active
@@ -576,7 +576,7 @@ class UsagePopup:
             else:
                 llm_backend.activate_local_llm()
                 self._llm_active = True
-                self._vars["llm_status"].set("Active: Local LLM  (localhost:8001)")
+                self._vars["llm_status"].set(f"Alt LLM ({config.LLM_URL})")
                 status_lbl.config(fg="#50d490")
                 toggle_btn.config(text="Switch to Claude API")
 
