@@ -13,13 +13,13 @@ import sys
 import threading
 from datetime import datetime, timedelta
 
-from config import CONSOLE_FETCHER_ENABLED, REFRESH_INTERVAL_SECONDS
-from logging_setup import log
-from startup import add_to_startup, remove_from_startup, startup_registered
-from tray_icon import make_tray_icon
-from usage_fetcher import BrowserLinker
-from usage_parser import get_usage_summary
-from usage_popup import UsagePopup
+from claude_observer.config import CONSOLE_FETCHER_ENABLED, REFRESH_INTERVAL_SECONDS
+from claude_observer.logging_setup import log
+from claude_observer.system.startup import add_to_startup, remove_from_startup, startup_registered
+from claude_observer.ui.tray_icon import make_tray_icon
+from claude_observer.browser.fetcher import BrowserLinker
+from claude_observer.core.usage_parser import get_usage_summary
+from claude_observer.ui.popup import UsagePopup
 
 
 class ClaudeUsageWidget:

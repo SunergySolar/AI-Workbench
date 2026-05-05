@@ -1,6 +1,6 @@
 """
-llm_backend.py
---------------
+backend.py
+----------
 Helpers for toggling Claude Code between the Anthropic API and a local LLM.
 
 Affected files:
@@ -15,8 +15,8 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-import config
-from logging_setup import log
+from claude_observer import config
+from claude_observer.logging_setup import log
 
 _CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 _CLAUDE_JSON = Path.home() / ".claude.json"
@@ -104,9 +104,9 @@ _server_lock = threading.Lock()
 
 
 def _build_server_cmd() -> list[str] | None:
-    import config
+    from claude_observer import config as _cfg
 
-    cmd_str = config.LLAMA_SERVER_CMD.strip()
+    cmd_str = _cfg.LLAMA_SERVER_CMD.strip()
     cmd = shlex.split(cmd_str, posix=False) if cmd_str else None
     log.debug("Built llama-server command: %s", cmd)
     return cmd

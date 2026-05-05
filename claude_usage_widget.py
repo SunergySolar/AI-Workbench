@@ -1,29 +1,18 @@
 """
-Claude Usage Taskbar Widget
-----------------------------
-Displays daily and weekly Claude Code token usage in the system tray,
-read directly from ~/.claude/projects/**/*.jsonl.
-
-Requirements:
-    pip install pystray Pillow
-
-Entry point — all logic lives in the modules below:
-    config.py          — .env loading and configuration constants
-    logging_setup.py   — shared logger
-    usage_parser.py    — JSONL parsing and get_usage_summary()
-    tray_icon.py       — make_tray_icon()
-    usage_popup.py     — UsagePopup (tkinter window)
-    usage_fetcher.py   — UsageFetcher (Selenium account-stats scraper)
-    startup.py         — Windows registry helpers
-    widget.py          — ClaudeUsageWidget (orchestrator)
+claude_usage_widget.py
+-----------------------
+Thin launcher — kept so the Windows startup registry entry still works.
+Run this directly or via:  python -m claude_observer
 """
 
-# config must be imported first so .env is loaded before any other module
-# reads environment variables.
-import config  # noqa: F401 (side-effect: .env loaded, env vars set)
-from logging_setup import log
-from widget import ClaudeUsageWidget
+import sys
+import os
+
+# Ensure the project root is on sys.path so the package is importable
+# when run as a plain script (e.g. from the Windows startup registry).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from claude_observer.__main__ import main
 
 if __name__ == "__main__":
-    log.info("Claude Usage Widget starting up")
-    ClaudeUsageWidget().run()
+    main()

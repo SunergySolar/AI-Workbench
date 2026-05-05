@@ -11,7 +11,7 @@ make_tray_icon(status) -> PIL.Image.Image
 
 from PIL import Image, ImageDraw
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 
 def make_tray_icon(status: str = "ok") -> Image.Image:

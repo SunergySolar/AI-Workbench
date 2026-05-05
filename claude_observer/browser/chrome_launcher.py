@@ -18,7 +18,7 @@ clear_session(profile_dir)
 import os
 import subprocess
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",

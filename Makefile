@@ -3,7 +3,7 @@
 CONTAINER_ID_FILE := .container_id
 
 run:
-	./launch_unsloth.sh | tee $(CONTAINER_ID_FILE)
+	./scripts/launch_unsloth.sh | tee $(CONTAINER_ID_FILE)
 
 start:
 	docker start $$(cat $(CONTAINER_ID_FILE))

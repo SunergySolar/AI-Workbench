@@ -1,6 +1,6 @@
 """
-usage_fetcher.py
-----------------
+fetcher.py
+----------
 Uses Chrome's DevTools Protocol (CDP) to read token-usage data from
 claude.ai/settings/usage.  No Selenium required — communicates directly with
 a visible Chrome window that the user opens by clicking "Link Browser" in the
@@ -22,22 +22,22 @@ import threading
 import time
 from datetime import datetime
 
-from config import (
+from claude_observer.config import (
     BROWSER_DEBUG_PORT,
     BROWSER_PROFILE_DIR,
     DEBUG_LOGGING,
 )
-from logging_setup import log
+from claude_observer.logging_setup import log
 
-from cdp_client import run_cdp_session
-from chrome_launcher import (
+from claude_observer.browser.cdp_client import run_cdp_session
+from claude_observer.browser.chrome_launcher import (
     find_chrome,
     start_chrome,
     session_exists,
     mark_session_ok,
     clear_session,
 )
-from response_parser import parse_response
+from claude_observer.browser.response_parser import parse_response
 
 
 class BrowserLinker:

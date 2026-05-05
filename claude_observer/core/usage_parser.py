@@ -17,8 +17,8 @@ import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
-from config import CLAUDE_DIR, INCLUDE_PATHS, EXCLUDE_WEEKDAYS
-from logging_setup import log
+from claude_observer.config import CLAUDE_DIR, INCLUDE_PATHS, EXCLUDE_WEEKDAYS
+from claude_observer.logging_setup import log
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ Usage
        chrome.exe --remote-debugging-port=9222
 
 2. In a separate terminal:
-       python cdp_spy.py
+       python -m claude_observer.browser.cdp_spy
 
 Press Ctrl-C to stop.
 """

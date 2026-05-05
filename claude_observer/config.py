@@ -10,7 +10,7 @@ from pathlib import Path
 
 # ── .env loader ───────────────────────────────────────────────────────────────
 
-_env_path = Path(__file__).parent / ".env"
+_env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
     for _line in _env_path.read_text().splitlines():
         _line = _line.strip()

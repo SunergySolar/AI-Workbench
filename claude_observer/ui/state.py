@@ -1,6 +1,6 @@
 """
-ui_state.py
------------
+state.py
+--------
 Persists UI state (e.g. which sections are open/closed) to
 ~/.claude_widget/ui_state.json between app launches.
 """
@@ -8,7 +8,7 @@ Persists UI state (e.g. which sections are open/closed) to
 import json
 from pathlib import Path
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 _STATE_FILE = Path.home() / ".claude_widget" / "ui_state.json"
 

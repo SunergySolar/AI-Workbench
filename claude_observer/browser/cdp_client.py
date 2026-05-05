@@ -24,7 +24,7 @@ run_cdp_session(
 import json as _json
 import time
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 _LOGIN_KEYWORDS = ("login", "signin", "/auth", "claude.ai/login")
 _URL_KEYWORDS = ("usage", "billing", "cost", "token", "organization", "metric")

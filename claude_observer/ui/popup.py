@@ -1,6 +1,6 @@
 """
-usage_popup.py
---------------
+popup.py
+--------
 Always-on-top popup window anchored above the system tray that displays
 token-usage data.  Built once; data is updated in-place via StringVars and
 canvas redraws.
@@ -19,10 +19,10 @@ import tkinter as tk
 from tkinter import ttk
 from datetime import date, datetime, timedelta
 
-from logging_setup import log
-import ui_state
-import llm_backend
-import config
+from claude_observer.logging_setup import log
+from claude_observer.ui import state as ui_state
+from claude_observer.llm import backend as llm_backend
+from claude_observer import config
 
 
 class UsagePopup:
@@ -887,12 +887,7 @@ class UsagePopup:
         fetched_at = state.get("fetched_at")
         error = state.get("error", "")
 
-        # ── Frame switchers ──
-        # Swaps between the "Link Browser" prompt and the live stats view
-        # depending on whether a browser session is currently linked.
-
         def _show_link_frame():
-            # Shows: "Open claude.ai/settings/usage in Chrome and link it…" + [Link Browser] button
             if self._cs_link_frame and not self._cs_link_frame.winfo_ismapped():
                 self._cs_link_frame.pack(fill="x", padx=16, pady=(8, 6))
             if self._cs_stats_frame and self._cs_stats_frame.winfo_ismapped():
@@ -900,7 +895,6 @@ class UsagePopup:
             self._win.after(50, lambda: self._fit_window())
 
         def _show_stats_frame():
-            # Shows: status line, daily section, weekly section, reset countdown
             if self._cs_link_frame and self._cs_link_frame.winfo_ismapped():
                 self._cs_link_frame.pack_forget()
             if self._cs_stats_frame and not self._cs_stats_frame.winfo_ismapped():
@@ -908,7 +902,6 @@ class UsagePopup:
             self._win.after(50, lambda: self._fit_window())
 
         def _clear():
-            # Resets all stat labels to "—" and empties both progress bars
             for k in (
                 "cs_d_head",
                 "cs_d_total",
@@ -924,10 +917,6 @@ class UsagePopup:
             if self._cs_w_bar:
                 self._draw_bar(self._cs_w_bar, 0, 0)
 
-        # ── Status routing ──
-        # Each branch controls which frame is visible and what the status
-        # line (small grey text at the top of the stats frame) shows.
-
         def _show_headless_btn(visible: bool, is_headless: bool = False):
             if self._cs_headless_btn is None:
                 return
@@ -940,34 +929,25 @@ class UsagePopup:
                 self._cs_headless_btn.pack_forget()
 
         if status == "unlinked":
-            # No browser linked yet — show the "Link Browser" prompt
             _show_link_frame()
             _show_headless_btn(False)
             return
         elif status == "loading":
-            # Browser is linked but data hasn't arrived yet
-            # Status line: "Loading…"
             _show_stats_frame()
             v["cs_status"].set("Loading…")
             _clear()
             _show_headless_btn(False)
         elif status == "waiting_login":
-            # Browser opened but user hasn't logged in to claude.ai
-            # Status line: "Waiting for login — check Chrome window…"
             _show_stats_frame()
             v["cs_status"].set("Waiting for login — check Chrome window…")
             _clear()
             _show_headless_btn(False)
         elif status == "error":
-            # Fetch failed — status line shows truncated error message
             _show_stats_frame()
             short = (error[:60] + "…") if len(error) > 60 else error
             v["cs_status"].set(f"Error: {short}")
             _show_headless_btn(False)
         elif status == "ok" and data:
-            # ── Linked & data available ──
-
-            # Status line: "Just fetched" or "Fetched N min ago"
             _show_stats_frame()
             if fetched_at:
                 self._cs_fetched_at = fetched_at
@@ -975,7 +955,6 @@ class UsagePopup:
             else:
                 v["cs_status"].set("OK")
 
-            # Helper to compute reset countdown strings from ISO timestamps, e.g. "Resets in 3h 12m (Mar 15)"
             def _reset_str(resets_at: str | None) -> str:
                 if not resets_at:
                     return ""
@@ -996,7 +975,6 @@ class UsagePopup:
                     return ""
 
             if data.get("format") == "utilization":
-                # ── Utilization format (five_hour / seven_day percentages) ──
                 fh = data.get("five_hour") or {}
                 sd = data.get("seven_day") or {}
 
@@ -1023,11 +1001,9 @@ class UsagePopup:
                     v["cs_w_pct"].set("")
                     self._draw_bar(self._cs_w_bar, 0, 0)
 
-                # Reset times are already shown inline under each row.
                 v["cs_reset"].set("")
 
             else:
-                # ── Token format (legacy bucket-based responses) ──
                 today = date.today()
                 week_start = today - timedelta(days=today.weekday())
 

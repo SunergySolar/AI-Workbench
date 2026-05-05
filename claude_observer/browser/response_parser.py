@@ -11,7 +11,7 @@ parse_response(body: dict) -> dict | None
 
 from datetime import date, datetime, timedelta
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 
 def parse_response(body: dict) -> dict | None:

@@ -12,18 +12,22 @@ remove_from_startup()
 
 import os
 import sys
+from pathlib import Path
 
-from logging_setup import log
+from claude_observer.logging_setup import log
 
 _STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_REG_NAME = "ClaudeUsageWidget"
+
+# Root of the project (three levels up from this file: system/ -> claude_observer/ -> root)
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 def _startup_command() -> str:
     """Build the command stored in the registry — uses pythonw to suppress the console."""
     log.debug("Starting _startup_command")
     pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    script  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_widget.py")
+    script  = str(_PROJECT_ROOT / "claude_usage_widget.py")
     result  = f'"{pythonw}" "{script}"'
     log.debug("Finished _startup_command: %s", result)
     return result
