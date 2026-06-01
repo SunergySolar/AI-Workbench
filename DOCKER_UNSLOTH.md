@@ -4,7 +4,7 @@ The Unsloth Docker image ships a prebuilt `llama.cpp` binary that may lack CUDA 
 
 ## How it works
 
-`docker-compose.yml` builds a custom image from `Dockerfile` instead of pulling `unsloth/unsloth:latest` directly. On first start, `entrypoint.sh`:
+`docker-compose.unsloth.yml` builds a custom image from `Dockerfile.unsloth` instead of pulling `unsloth/unsloth:latest` directly. On first start, `entrypoint.sh`:
 
 1. Removes the prebuilt CPU-only `llama.cpp`
 2. Clones `llama.cpp` from source
@@ -24,8 +24,8 @@ After installing, restart Docker (`sudo systemctl restart docker`) before procee
 ## Starting the container
 
 ```bash
-docker compose up --build   # first run — builds the image and compiles llama.cpp
-docker compose up           # subsequent runs — reuses the volume, skips compile
+docker compose -f docker-compose.unsloth.yml up --build   # first run — builds the image and compiles llama.cpp
+docker compose -f docker-compose.unsloth.yml up            # subsequent runs — reuses the volume, skips compile
 ```
 
 Or use the Makefile helpers:
@@ -39,7 +39,7 @@ Or use the Makefile helpers:
 
 ## GPU compute capability
 
-`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile` for other GPUs. Full list: https://developer.nvidia.com/cuda-gpus
+`89` targets Ada Lovelace (RTX 4080 / 4090). Adjust `-DCMAKE_CUDA_ARCHITECTURES` in `Dockerfile.unsloth` for other GPUs. Full list: https://developer.nvidia.com/cuda-gpus
 
 | Architecture | Value | Example GPUs |
 |---|---|---|
@@ -50,8 +50,8 @@ Or use the Makefile helpers:
 ## Verifying GPU is active
 
 ```bash
-docker compose exec unsloth \
+docker compose -f docker-compose.unsloth.yml exec unsloth \
   /home/unsloth/.unsloth/llama.cpp/build/bin/llama-server --version 2>&1
 ```
 
-If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker-compose.yml`) and that the host has the NVIDIA Container Toolkit installed.
+If GPU layers are still not loading, confirm the container has access to the NVIDIA runtime (`runtime: nvidia` in `docker-compose.unsloth.yml`) and that the host has the NVIDIA Container Toolkit installed.
