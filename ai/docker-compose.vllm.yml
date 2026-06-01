@@ -17,7 +17,7 @@ services:
               count: all
               capabilities: [gpu]
     command: >
-      --model Qwen/Qwen3.6-35B-A3B
+      --model Qwen/Qwen3-4B-A3B-Instruct
       --dtype float16
       --max-model-len 8192
       --gpu-memory-utilization 0.5

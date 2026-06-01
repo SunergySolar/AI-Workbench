@@ -96,3 +96,32 @@ make clean-vllm      # Stop and remove vLLM containers
 make logs-vllm       # Follow vLLM logs
 make build-vllm      # Build vLLM images
 ```
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in the values.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEBUG_LOGGING` | `false` | Write DEBUG-level logs to the log file |
+| `INCLUDE_PATHS` | _(empty)_ | Comma-separated path prefixes to filter project sessions. Leave blank to include all |
+| `EXCLUDE_WEEKDAYS` | `5,6` | Days excluded from rolling averages (0=Monday, 6=Sunday) |
+| `CONSOLE_FETCHER_ENABLED` | `false` | Scrape console.anthropic.com for account-level usage |
+| `CONSOLE_REFRESH_MINUTES` | `30` | Minutes between console scraping refreshes |
+| `CONSOLE_HEADLESS` | `true` | Run Chrome headless for scraping (`false` keeps window visible) |
+| `CHROME_PATHS_VAR` | _(empty)_ | Alternative Chrome executable path. Leave empty to use defaults |
+| `LLM_LOG_MAX_LINES` | `200` | Max lines kept in the LLM Backend server log |
+| `LLM_URL` | `http://localhost:8001` | Base URL for the local LLM server |
+| `LLM_API_KEY` | _(empty)_ | API key sent to the local LLM server |
+| `LLM_MODEL` | _(empty)_ | Model alias passed to Claude Code |
+| `LLAMA_SERVER_CMD` | _(empty)_ | Full shell command to launch llama-server |
+| `BROWSER_DEBUG_PORT` | `9222` | Chrome remote-debugging port for CDP |
+| `KEEP_LLM_ACTIVE` | `true` | Keep the local LLM server running when switching away |
+| `HF_TOKEN` | _(empty)_ | HuggingFace token for gated model downloads (vLLM, LiteLLM) |
+| `LITELLM_MASTER_KEY` | _(empty)_ | Master key for the LiteLLM proxy |
+| `LITELLM_SALT_KEY` | _(empty)_ | Salt key for LiteLLM |
+| `LITELLM_MODEL_NAME` | _(empty)_ | Model alias used in LiteLLM requests |
+| `LITELLM_MODEL` | _(empty)_ | Full model spec (e.g. `openai/unsloth/Qwen3.6-35B-A3B-GGUF`) |
+| `LITELLM_API_KEY` | _(empty)_ | API key forwarded to the upstream LLM |
+| `LITELLM_API_BASE` | _(empty)_ | Upstream API base URL (must include `/v1` for OpenAI-compatible endpoints) |
+| `LITELLM_DATABASE_URL` | _(empty)_ | PostgreSQL connection string for LiteLLM |

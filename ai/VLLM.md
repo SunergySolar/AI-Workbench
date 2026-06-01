@@ -12,7 +12,7 @@ This launches two containers by default:
 
 | Container | Port | Model |
 |---|---|---|
-| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen3.6-35B-A3B` |
+| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen3-4B-A3B-Instruct` |
 | `vllm-llama` | `localhost:8003` | `meta-llama/Llama-3.2-3B-Instruct-AWQ` |
 
 Test with:
@@ -33,7 +33,17 @@ curl http://localhost:8003/v1/chat/completions \
 
 Each service in `ai/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
-The HuggingFace token (`HF_TOKEN`) is still read from `.env` so gated models can be downloaded. All other settings (port, model name, context length, GPU utilization) are hardcoded in the compose file.
+The HuggingFace token (`HF_TOKEN`) is read from `.env` so gated models can be downloaded.
+
+### HuggingFace Token Setup
+
+Gated models like Llama require a HuggingFace access token:
+
+1. **Create a token**: Go to Settings → Access Tokens in your HuggingFace profile and create a new "Read" token.
+2. **Accept model licenses**: Some models (e.g. Llama) require you to accept their license on the model page first. Click "Agree and Access" on the model's HuggingFace page before the token will work.
+3. **Add to `.env`**: Set `HF_TOKEN=<your-token>` in your project's `.env` file.
+
+The token only needs **Read** permissions — model access is granted per-model via license acceptance, not token scopes.
 
 ### Adding more models
 
