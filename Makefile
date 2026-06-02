@@ -1,7 +1,7 @@
-DC = docker compose -f ai/docker-compose.yml
-DC_LITE = docker compose -f ai/docker-compose.litellm.yml
-DC_UNSLOTH = docker compose -f ai/docker-compose.unsloth.yml
-DC_VLLM = docker compose -f ai/docker-compose.vllm.yml
+DC = docker compose -f ai/docker-compose.yml --env-file .env
+DC_LITE = docker compose -f ai/docker-compose.litellm.yml --env-file .env
+DC_UNSLOTH = docker compose -f ai/docker-compose.unsloth.yml --env-file .env
+DC_VLLM = docker compose -f ai/docker-compose.vllm.yml --env-file .env
 UP_FLAGS ?= -d --remove-orphans
 
 setup:
