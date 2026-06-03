@@ -1,0 +1,34 @@
+services:
+  kokoro-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.kokoro-app
+    container_name: kokoro-app
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    volumes:
+      - kokoro_data:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  kokoro-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.kokoro-api
+    container_name: kokoro-api
+    restart: unless-stopped
+    environment:
+      - KOKORO_APP_URL=http://kokoro-app:8080
+    ports:
+      - "8004:8000"
+    depends_on:
+      - kokoro-app
+
+volumes:
+  kokoro_data:

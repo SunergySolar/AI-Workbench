@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# System deps: espeak-ng for G2P, plus curl for health checks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        espeak-ng \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-kokoro.txt .
+RUN pip install --no-cache-dir -r requirements-kokoro.txt
+
+COPY kokoro/app.py .
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8080/voices || exit 1
+
+CMD ["python", "app.py"]

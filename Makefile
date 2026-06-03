@@ -1,4 +1,5 @@
 DC = docker compose -f ai/docker-compose.yml --env-file .env
+DC_KOKORO = docker compose -f ai/docker-compose.kokoro.yml --env-file .env
 DC_LITE = docker compose -f ai/docker-compose.litellm.yml --env-file .env
 DC_UNSLOTH = docker compose -f ai/docker-compose.unsloth.yml --env-file .env
 DC_VLLM = docker compose -f ai/docker-compose.vllm.yml --env-file .env
@@ -21,6 +22,9 @@ up-unsloth:
 up-vllm:
 	$(DC_VLLM) up -d vllm-qwen vllm-llama
 
+up-kokoro:
+	$(DC_KOKORO) up -d kokoro-app kokoro-api
+
 down:
 	$(DC) stop
 
@@ -32,6 +36,9 @@ down-unsloth:
 
 down-vllm:
 	$(DC_VLLM) stop vllm-qwen vllm-llama
+
+down-kokoro:
+	$(DC_KOKORO) stop kokoro-app kokoro-api
 
 clean:
 	$(DC) down --volumes --remove-orphans
@@ -48,6 +55,9 @@ clean-unsloth:
 clean-vllm:
 	$(DC_VLLM) stop vllm-qwen vllm-llama && $(DC_VLLM) rm -f vllm-qwen vllm-llama
 
+clean-kokoro:
+	$(DC_KOKORO) stop kokoro-app kokoro-api && $(DC_KOKORO) rm -f kokoro-app kokoro-api
+
 logs:
 	$(DC) logs -f
 
@@ -59,6 +69,9 @@ logs-unsloth:
 
 logs-vllm:
 	$(DC_VLLM) logs -f
+
+logs-kokoro:
+	$(DC_KOKORO) logs -f
 
 build:
 	$(DC) build
@@ -72,4 +85,7 @@ build-unsloth:
 build-vllm:
 	$(DC_VLLM) build
 
-.PHONY: setup up up-litellm up-unsloth up-vllm down down-litellm down-unsloth down-vllm clean very-clean clean-litellm clean-unsloth clean-vllm logs logs-litellm logs-unsloth logs-vllm build build-litellm build-unsloth build-vllm
+build-kokoro:
+	$(DC_KOKORO) build kokoro-app kokoro-api
+
+.PHONY: setup up up-litellm up-unsloth up-vllm up-kokoro down down-litellm down-unsloth down-vllm down-kokoro clean very-clean clean-litellm clean-unsloth clean-vllm clean-kokoro logs logs-litellm logs-unsloth logs-vllm logs-kokoro build build-litellm build-unsloth build-vllm build-kokoro
