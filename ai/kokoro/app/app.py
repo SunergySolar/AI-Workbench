@@ -36,8 +36,12 @@ def _get_pipeline():
 def _get_voices():
     global _voices  # noqa: PLW0603
     if _voices is None:
-        from misaki.kokoro import VOICES
-        _voices = list(VOICES)
+        from huggingface_hub import list_repo_files
+        _voices = [
+            f.removeprefix("voices/").removesuffix(".pt")
+            for f in list_repo_files("hexgrad/Kokoro-82M")
+            if f.startswith("voices/") and f.endswith(".pt")
+        ]
         logger.info("Discovered %d voices.", len(_voices))
     return _voices
 

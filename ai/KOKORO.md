@@ -36,7 +36,10 @@ The response is a WAV file. The default voice is `af_heart` if `voice` is omitte
 
 ### Dependencies
 
-- `HF_TOKEN` from `.env` — HuggingFace token for downloading the Kokoro model weights on first run
+| Variable | Default | Purpose |
+|---|---|---|
+| `HF_TOKEN` | — | HuggingFace token for downloading model weights on first run |
+| `KOKORO_APP_URL` | `http://kokoro-app:8080` | URL the API proxy uses to reach the inference container. In Docker Compose this resolves via the service name. For local dev set it to `http://localhost:8080` in `.env`. |
 
 ### Model loading
 

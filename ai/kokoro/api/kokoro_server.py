@@ -41,3 +41,8 @@ def generate(text: str, voice: str = "af_heart"):
         return Response(content=audio_bytes, media_type="audio/wav")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Cannot reach kokoro-app: {exc}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
