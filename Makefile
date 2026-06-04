@@ -17,7 +17,7 @@ clean-$(1):
 	$$(DC_$(1)) stop $(2) && $$(DC_$(1)) rm -f $(2)
 
 very-clean-$(1):
-	$$(DC_$(1)) down --volumes --remove-orphans --rmi all
+	$$(DC_$(1)) down --volumes --rmi all $(2)
 
 logs-$(1):
 	$$(DC_$(1)) logs -f $(2)
