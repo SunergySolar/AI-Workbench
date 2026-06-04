@@ -97,6 +97,39 @@ make logs-vllm       # Follow vLLM logs
 make build-vllm      # Build vLLM images
 ```
 
+## Adding or Removing a Service
+
+The Makefile uses a macro to generate `up-*`, `down-*`, `clean-*`, `logs-*`, and `build-*` targets for each service stack. Adding or removing a service is a two-step change.
+
+### Add a service
+
+1. Create `ai/docker-compose.<name>.yml` with the service definition.
+2. Add one line to the `Makefile` with the stack name and the space-separated list of Docker Compose service names to target:
+
+```makefile
+$(eval $(call service,<name>,<service1> <service2> ...))
+```
+
+Example — adding a Whisper stack that runs two containers:
+
+```makefile
+$(eval $(call service,whisper,whisper-api whisper-worker))
+```
+
+This immediately makes `make up-whisper`, `make down-whisper`, `make clean-whisper`, `make logs-whisper`, and `make build-whisper` available. The compose file must be named `ai/docker-compose.whisper.yml`.
+
+### Remove a service
+
+Delete the corresponding `$(eval $(call service,...))` line from the `Makefile`. That's it — all five generated targets disappear with it.
+
+### Naming rules
+
+| Constraint | Detail |
+|---|---|
+| Stack name | Must match the suffix of the compose filename: `service,foo,...` → `ai/docker-compose.foo.yml` |
+| Service list | Space-separated Docker Compose service names (second argument). These are passed directly to `docker compose up/stop/rm/build`. |
+| Multiple services | All listed services are started/stopped together as a group (e.g. `vllm-qwen vllm-llama`). |
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill in the values.
