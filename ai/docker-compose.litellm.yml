@@ -2,11 +2,14 @@ networks:
   shared:
     external: true
     name: ai_shared
+  internal:
+    driver: bridge
 
 services:
   litellm:
     networks:
       - shared
+      - internal
     build:
       context: .
       dockerfile: Dockerfile.litellm
@@ -36,6 +39,8 @@ services:
     image: postgres:16
     restart: always
     container_name: litellm_db
+    networks:
+      - internal
     environment:
       POSTGRES_DB: litellm
       POSTGRES_USER: llmproxy
