@@ -35,6 +35,8 @@ curl http://localhost:8003/v1/chat/completions \
 
 Each service in `ai/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
+For strategies on dividing GPU resources between containers (time-slicing, MIG, `--gpu-memory-utilization` tuning), see [GPU_SHARING_GUIDE.md](GPU_SHARING_GUIDE.md).
+
 The HuggingFace token (`HF_TOKEN`) is read from `.env` so gated models can be downloaded.
 
 ### HuggingFace Token Setup
