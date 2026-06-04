@@ -58,8 +58,6 @@ make setup
 
 Run `make help` to list all available targets, including any service stacks currently registered in the Makefile.
 
-
-
 ### Main stack
 
 ```bash
@@ -71,39 +69,9 @@ make logs            # Follow logs
 make build           # Build images
 ```
 
-### LiteLLM
-
-```bash
-make up-litellm      # Start LiteLLM proxy
-make down-litellm    # Stop LiteLLM
-make clean-litellm   # Stop and remove LiteLLM container
-make logs-litellm    # Follow LiteLLM logs
-make build-litellm   # Build LiteLLM image
-```
-
-### Unsloth
-
-```bash
-make up-unsloth      # Start Unsloth
-make down-unsloth    # Stop Unsloth
-make clean-unsloth   # Stop and remove Unsloth container
-make logs-unsloth    # Follow Unsloth logs
-make build-unsloth   # Build Unsloth image
-```
-
-### vLLM
-
-```bash
-make up-vllm         # Start vLLM (Qwen + Llama)
-make down-vllm       # Stop vLLM
-make clean-vllm      # Stop and remove vLLM containers
-make logs-vllm       # Follow vLLM logs
-make build-vllm      # Build vLLM images
-```
-
 ## Adding or Removing a Service
 
-The Makefile uses a macro to generate `up-*`, `down-*`, `clean-*`, `logs-*`, and `build-*` targets for each service stack. Adding or removing a service is a two-step change.
+The Makefile uses a macro to generate `up-*`, `down-*`, `clean-*`, `very-clean-*`, `logs-*`, and `build-*` targets for each service stack. Adding or removing a service is a two-step change.
 
 ### Add a service
 
@@ -120,7 +88,7 @@ Example — adding a Whisper stack that runs two containers:
 $(eval $(call service,whisper,whisper-api whisper-worker))
 ```
 
-This immediately makes `make up-whisper`, `make down-whisper`, `make clean-whisper`, `make logs-whisper`, and `make build-whisper` available. The compose file must be named `ai/docker-compose.whisper.yml`.
+This immediately makes `make up-whisper`, `make down-whisper`, `make clean-whisper`, `make very-clean-whisper`, `make logs-whisper`, and `make build-whisper` available. The compose file must be named `ai/docker-compose.whisper.yml`.
 
 ### Remove a service
 

@@ -16,13 +16,16 @@ down-$(1):
 clean-$(1):
 	$$(DC_$(1)) stop $(2) && $$(DC_$(1)) rm -f $(2)
 
+very-clean-$(1):
+	$$(DC_$(1)) down --volumes --remove-orphans --rmi all
+
 logs-$(1):
 	$$(DC_$(1)) logs -f $(2)
 
 build-$(1):
 	$$(DC_$(1)) build $(2)
 
-.PHONY: up-$(1) down-$(1) clean-$(1) logs-$(1) build-$(1)
+.PHONY: up-$(1) down-$(1) clean-$(1) very-clean-$(1) logs-$(1) build-$(1)
 endef
 
 $(eval $(call service,litellm,litellm))
@@ -65,7 +68,7 @@ help:
 	@echo "  make build       Rebuild images"
 	@echo ""
 	@echo "Service stacks:"
-	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  logs-$(s)  build-$(s)";)
+	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  very-clean-$(s)  logs-$(s)  build-$(s)";)
 	@echo ""
 
 .PHONY: setup up down clean very-clean logs build help
