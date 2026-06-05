@@ -36,6 +36,20 @@ curl http://localhost:4001/v1/chat/completions \
 
 Replace the `content` with the actual result from calling the tool on your MCP server.
 
+## Add MCP Servers to Claude Code
+
+Use `claude mcp add` to connect MCP servers to Claude Code. The server name in the URL path must match the key defined under `mcp_servers:` in your LiteLLM config.
+
+```bash
+# Kokoro TTS MCP
+claude mcp add --transport http kokoro http://192.168.5.233:4001/mcp/kokoro_tts \
+  --header "Authorization: Bearer sk-your-master-key"
+
+# Phoenix MCP
+claude mcp add --transport http phoenix http://192.168.5.233:4001/mcp/phoenix \
+  --header "Authorization: Bearer sk-your-phoenix-auth-value"
+```
+
 ## MCP API Token
 
 Some MCP servers issue long-lived API tokens via a browser-based OAuth flow. Check your MCP server's documentation for token acquisition.
