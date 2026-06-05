@@ -1,8 +1,12 @@
 include:
-  - docker-compose.litellm.yml
-  - docker-compose.vllm.yml
-  - docker-compose.kokoro.yml
-#  - docker-compose.unsloth.yml
+  - path: docker-compose.litellm.yml
+    env_file: ../.env
+  - path: docker-compose.vllm.yml
+    env_file: ../.env
+  - path: docker-compose.kokoro.yml
+    env_file: ../.env
+  - path: docker-compose.unsloth.yml
+    env_file: ../.env
 
 networks:
   shared:
