@@ -16,6 +16,10 @@ clean-$(1):
 	$$(DC_$(1)) stop $(2) && $$(DC_$(1)) rm -f $(2)
 
 very-clean-$(1):
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "WARNING: This will stop containers, remove all volumes and images for $(1). Type CONFIRM=yes to proceed."; \
+		false; \
+	fi
 	$$(DC_$(1)) down --volumes --rmi all $(2)
 
 logs-$(1):
@@ -50,6 +54,10 @@ clean:
 	$(foreach s,$(SERVICES),$(DC_$(s)) stop && $(DC_$(s)) rm -f;)
 
 very-clean:
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "WARNING: This will stop containers, remove all volumes and images. Type CONFIRM=yes to proceed."; \
+		false; \
+	fi
 	$(foreach s,$(SERVICES),$(DC_$(s)) down --volumes --rmi all;)
 
 build:
