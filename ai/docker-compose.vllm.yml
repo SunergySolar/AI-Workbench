@@ -66,7 +66,7 @@ services:
     command: >
       --model Qwen/Qwen3.6-35B-A3B
       --dtype float16
-      --max-model-len 8192
+      --max-model-len 128000
       --gpu-memory-utilization 0.8
 
 volumes:
