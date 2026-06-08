@@ -1,13 +1,3 @@
-include:
-  - path: docker-compose.litellm.yml
-    env_file: ../.env
-  - path: docker-compose.vllm.yml
-    env_file: ../.env
-  - path: docker-compose.kokoro.yml
-    env_file: ../.env
-  - path: docker-compose.unsloth.yml
-    env_file: ../.env
-
 networks:
   shared:
     external: true

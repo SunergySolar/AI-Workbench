@@ -1,11 +1,10 @@
-DC = docker compose -f ai/docker-compose.yml --env-file .env
-UP_FLAGS ?= -d --remove-orphans
 SERVICES :=
 
 define service
 SERVICES += $(1)
+SERVICES_ARGS_$(1) := $(2)
 
-DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p $(1)
+DC_$(1) := docker compose -f ai/docker-compose.$(1).yml --env-file .env -p ai-$(1)
 
 up-$(1):
 	$$(DC_$(1)) up -d $(2)
@@ -36,43 +35,43 @@ $(eval $(call service,kokoro,kokoro-app kokoro-api))
 setup: network
 	cd widget && uv sync && cd ..
 	cd widget && uv run claude_usage_widget.py &
-	$(DC) up --build $(UP_FLAGS)
+	$(foreach s,$(SERVICES),$(DC_$(s)) up --build -d &&) true
 
 network:
 	docker network create ai_shared 2>/dev/null || true
 
-up:
-	$(DC) up $(UP_FLAGS)
+up: network
+	$(foreach s,$(SERVICES),$(DC_$(s)) up -d &&) true
 
 down:
-	$(DC) stop
+	$(foreach s,$(SERVICES),$(DC_$(s)) stop;)
 
 clean:
-	$(DC) down --volumes --remove-orphans
+	$(foreach s,$(SERVICES),$(DC_$(s)) stop && $(DC_$(s)) rm -f;)
 
 very-clean:
-	$(DC) down --volumes --remove-orphans --rmi all
-
-logs:
-	$(DC) logs -f
+	$(foreach s,$(SERVICES),$(DC_$(s)) down --volumes --rmi all;)
 
 build:
-	$(DC) build
+	$(foreach s,$(SERVICES),$(DC_$(s)) build &&) true
+
+logs:
+	@echo "Use logs-<service> to follow specific service logs."
+	@echo "Services: $(SERVICES)"
 
 help:
 	@echo ""
 	@echo "Main stack:"
 	@echo "  make setup       Install deps and start all services"
 	@echo "  make network     Create shared Docker network"
-	@echo "  make up          Start"
-	@echo "  make down        Stop"
-	@echo "  make clean       Stop and remove containers + volumes"
+	@echo "  make up          Start all services"
+	@echo "  make down        Stop all services"
+	@echo "  make clean       Stop and remove containers"
 	@echo "  make very-clean  Stop, remove containers, volumes, and images"
-	@echo "  make logs        Follow logs"
-	@echo "  make build       Rebuild images"
+	@echo "  make build       Rebuild all images"
 	@echo ""
 	@echo "Service stacks:"
 	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  very-clean-$(s)  logs-$(s)  build-$(s)";)
 	@echo ""
 
-.PHONY: setup up down clean very-clean logs build help
+.PHONY: setup up down clean very-clean build logs help network
