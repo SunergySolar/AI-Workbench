@@ -11,6 +11,7 @@ general_settings:
   enable_metrics: true
   store_model_in_db: true
   default_max_tokens: 262144
+  always_include_stream_usage: true
 
 mcp_servers:
   kokoro_tts:
