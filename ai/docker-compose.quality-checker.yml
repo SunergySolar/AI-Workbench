@@ -13,7 +13,7 @@ services:
     container_name: quality-checker
     restart: unless-stopped
     ports:
-      - "8005:8000"
+      - "${PORT_QUALITY_CHECKER}:8000"
     environment:
       - VLLM_QWEN_VL_API=http://vllm-qwen-vl:8000/v1/chat/completions
     healthcheck:

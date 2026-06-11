@@ -24,14 +24,14 @@ Mount the MPS Unix socket into each container that needs GPU access:
 
 ```yaml
 services:
-  vllm-llama:
+  vllm-qwen:
     # ... existing config ...
     volumes:
       - /tmp/nvidia-mps:/tmp/nvidia-mps
     environment:
       - NVIDIA_MPS=1
 
-  vllm-qwen:
+  vllm-qwen-vl:
     # ... existing config ...
     volumes:
       - /tmp/nvidia-mps:/tmp/nvidia-mps
@@ -103,7 +103,7 @@ Reference the MIG device by its GPU index instead of `count: all`:
 
 ```yaml
 services:
-  vllm-llama:
+  vllm-qwen:
     deploy:
       resources:
         reservations:
@@ -112,7 +112,7 @@ services:
               devices: ["0"]        # MIG slice 0 on GPU 0
               capabilities: [gpu]
 
-  vllm-qwen:
+  vllm-qwen-vl:
     deploy:
       resources:
         reservations:
@@ -147,6 +147,6 @@ services:
 
 ## Current stack notes
 
-Your [docker-compose.vllm.yml](docker-compose.vllm.yml) uses `count: all` with `--gpu-memory-utilization 0.5` on each service — this relies on the CUDA driver to time-share the GPU, which works but isn't optimal. Both services can see the full VRAM pool and may OOM if their combined needs exceed physical memory.
+Your [docker-compose.vllm.yml](docker-compose.vllm.yml) uses `count: all` on both `vllm-qwen` (0.8 utilization) and `vllm-qwen-vl` (0.4 utilization) — this relies on the CUDA driver to time-share the GPU, which works but isn't optimal. Both services can see the full VRAM pool and may OOM if their combined needs exceed physical memory.
 
 Neither MPS nor MIG is currently configured. Adding either would make the two vLLM instances more predictable when running simultaneously.
