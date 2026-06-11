@@ -45,7 +45,6 @@ services:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
       - VLLM_SLEEP_WHEN_IDLE=1
       - VLLM_USE_DEEP_GEMM=0
-      - VLLM_USE_FLASHINFER_MOE_FP16=1
       - VLLM_USE_FLASHINFER_SAMPLER=0
     ports:
       - "${PORT_VLLM_QWEN}:8000"
@@ -101,7 +100,7 @@ services:
       --model Qwen/Qwen2.5-VL-7B-Instruct
       --dtype float16
       --max-model-len 8192
-      --gpu-memory-utilization 0.4
+      --gpu-memory-utilization 0.35
       --enforce-eager
 
 volumes:
