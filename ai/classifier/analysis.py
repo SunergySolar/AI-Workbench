@@ -172,13 +172,6 @@ async def analyze_bgr(
     llm_result = await call_vllm(build_llm_prompt(image_b64, criteria))
     assessment = validate_and_clamp(llm_result.get("assessment", {}), criteria)
 
-    per_criterion = assessment.get("per_criterion_scores", {})
-    merged = [k for k in cv_results if k not in per_criterion]
-    for k in merged:
-        per_criterion[k] = cv_results[k]
-    if merged:
-        logger.debug("analyze_bgr: merged CV results for: %s", merged)
-
     cv_failures = sum(1 for r in cv_results.values() if r["verdict"] == "FAIL")
     cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
 
