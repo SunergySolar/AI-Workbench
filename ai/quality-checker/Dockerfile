@@ -11,8 +11,8 @@ WORKDIR /app
 COPY quality-checker/pyproject.toml .
 RUN uv sync --no-dev
 
-COPY quality-checker/quality_checker.py .
+COPY quality-checker/*.py .
 
 EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "quality_checker:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
