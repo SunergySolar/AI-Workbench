@@ -98,7 +98,7 @@ def poll_job(
     sys.exit(f"Timed out after {max_wait}s — last status: {status}")
 
 
-def print_result(job: dict) -> None:
+def print_result(job: dict, criteria: list = None) -> None:
     if job["status"] == "completed":
         result = job.get("result", {})
         assessment = result.get("llm_assessment", {})
@@ -115,12 +115,18 @@ def print_result(job: dict) -> None:
         print(f"{'-' * 60}")
 
         per = assessment.get("per_criterion_scores", {})
+        # Build weight lookup from the criteria file if available
+        weight_map = {c["name"]: c.get("weight", 1.0) for c in (criteria or [])}
         if per:
             print("\n  Per-criterion scores:")
             for name, val in per.items():
-                conf = f"  confidence={val.get('confidence', '?')}" if isinstance(val, dict) else ""
+                if not isinstance(val, dict):
+                    continue
+                weight = weight_map.get(name, 1.0)
+                weight_str = f"  weight={weight}"
+                conf = f"  confidence={val.get('confidence', '?')}"
                 print(f"    {name:<35} {val.get('verdict', '?'):<10} "
-                      f"score={val.get('score', '?')}{conf}")
+                      f"score={val.get('score', '?')}{conf}{weight_str}")
                 reason = val.get("reason", "")
                 if reason:
                     print(f"      {reason}")
@@ -196,7 +202,7 @@ def main() -> None:
     print("Polling for result...")
     job = poll_job(args.base_url, api_key, job_id, args.max_wait, args.poll_interval)
 
-    print_result(job)
+    print_result(job, criteria)
 
 
 if __name__ == "__main__":

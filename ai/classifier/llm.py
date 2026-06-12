@@ -287,6 +287,22 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
         val["verdict"] = _verdict_from_score(score)
 
     assessment["per_criterion_scores"] = per_criterion
+
+    # Recompute overall score as weighted average of clamped per-criterion scores
+    matched = [
+        (c, per_criterion[c.name]) for c in criteria
+        if c.name in per_criterion and isinstance(per_criterion[c.name], dict)
+    ]
+    if matched:
+        total_weight = sum(c.weight for c, _ in matched)
+        if total_weight > 0:
+            weighted_sum = sum(val["score"] * c.weight for c, val in matched)
+            weighted_score = max(1, min(10, round(weighted_sum / total_weight)))
+            assessment["overall_score"] = weighted_score
+            assessment["overall_verdict"] = _verdict_from_score(weighted_score)
+            logger.debug("validate_and_clamp: weighted score=%s weights=%s",
+                         weighted_score, {c.name: c.weight for c, _ in matched})
+
     logger.info("validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
                 assessment["overall_score"], assessment["overall_verdict"],
                 list(per_criterion.keys()))

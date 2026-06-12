@@ -14,6 +14,14 @@ class CriterionInput(BaseModel):
             "'feature': detect presence/absence (10=clearly present, 5=uncertain, 1=clearly absent)."
         ),
     )
+    weight: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Relative weight for this criterion when computing the overall score. "
+            "Higher values make this criterion matter more. Default 1.0 for equal weighting."
+        ),
+    )
 
 
 class ImageInput(BaseModel):
