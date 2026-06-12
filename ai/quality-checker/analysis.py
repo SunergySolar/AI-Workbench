@@ -6,6 +6,7 @@ import numpy as np
 from fastapi import HTTPException, UploadFile
 
 from config import MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
+from logger import logger
 from models import CriterionInput, ImageInput, ExampleInput
 from cv import check_blur, check_exposure
 from llm import encode_image_to_base64, build_llm_prompt, call_vllm, validate_and_clamp
@@ -18,13 +19,14 @@ _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 # ---------------------------------------------------------------------------
 
 def parse_criteria(raw: str) -> list[CriterionInput]:
-    """Parse a JSON string into a validated list of CriterionInput objects."""
+    logger.info("parse_criteria: raw=%s", raw[:200])
     try:
         parsed = json.loads(raw)
         if not isinstance(parsed, list):
             raise ValueError("criteria must be a JSON array")
-        return [CriterionInput(**item) for item in parsed]
+        result = [CriterionInput(**item) for item in parsed]
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.error("parse_criteria: failed to parse criteria: %s", exc)
         raise HTTPException(
             status_code=400,
             detail=(
@@ -33,6 +35,8 @@ def parse_criteria(raw: str) -> list[CriterionInput]:
                 '[{"name": "image sharpness", "type": "quality"}]'
             ),
         )
+    logger.info("parse_criteria: returning %d criteria: %s", len(result), [c.name for c in result])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +44,10 @@ def parse_criteria(raw: str) -> list[CriterionInput]:
 # ---------------------------------------------------------------------------
 
 def _validate_image_dimensions(w: int, h: int) -> None:
+    logger.debug("_validate_image_dimensions: w=%d h=%d (min %dx%d)",
+                 w, h, MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT)
     if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
+        logger.warning("_validate_image_dimensions: image too small (%dx%d)", w, h)
         raise HTTPException(
             status_code=400,
             detail=(
@@ -48,22 +55,30 @@ def _validate_image_dimensions(w: int, h: int) -> None:
                 f"Minimum is {MIN_IMAGE_WIDTH}×{MIN_IMAGE_HEIGHT} px."
             ),
         )
+    logger.debug("_validate_image_dimensions: dimensions valid")
 
 
 async def _bytes_to_bgr(raw: bytes):
     import cv2
+    logger.debug("_bytes_to_bgr: decoding %d bytes", len(raw))
     nparr = np.frombuffer(raw, np.uint8)
     bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if bgr is None:
+        logger.error("_bytes_to_bgr: failed to decode image from %d bytes", len(raw))
         raise HTTPException(status_code=400, detail="Failed to decode image")
+    logger.debug("_bytes_to_bgr: returning image shape=%s", bgr.shape)
     return bgr
 
 
 async def _load_bgr_from_input(data: str, type_: str):
+    data_repr = data[:80] if type_ == "url" else f"base64[{len(data)} chars]"
+    logger.debug("_load_bgr_from_input: type=%s data=%s", type_, data_repr)
+
     if type_ == "base64":
         try:
             raw = base64.b64decode(data)
         except Exception as exc:
+            logger.error("_load_bgr_from_input: invalid base64 data: %s", exc)
             raise HTTPException(status_code=400, detail=f"Invalid base64 data: {exc}")
     else:
         try:
@@ -71,9 +86,14 @@ async def _load_bgr_from_input(data: str, type_: str):
                 r = await client.get(data, headers={"User-Agent": "QualityChecker/1.0"})
                 r.raise_for_status()
                 raw = r.content
+            logger.debug("_load_bgr_from_input: fetched %d bytes from URL", len(raw))
         except httpx.HTTPError as exc:
+            logger.error("_load_bgr_from_input: failed to fetch URL '%s': %s", data[:80], exc)
             raise HTTPException(status_code=502, detail=f"Failed to fetch image URL: {exc}")
-    return await _bytes_to_bgr(raw)
+
+    bgr = await _bytes_to_bgr(raw)
+    logger.debug("_load_bgr_from_input: returning image shape=%s", bgr.shape)
+    return bgr
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +109,8 @@ async def analyze_bgr(
     criteria: list[CriterionInput],
 ) -> dict:
     import cv2
+    logger.info("analyze_bgr: image=%dx%d content_type=%s size=%d bytes criteria=%s",
+                original_w, original_h, content_type, size_bytes, [c.name for c in criteria])
 
     _validate_image_dimensions(original_w, original_h)
 
@@ -99,11 +121,14 @@ async def analyze_bgr(
             image_bgr, (int(original_w * scale), int(original_h * scale)),
             interpolation=cv2.INTER_AREA,
         )
+        logger.debug("analyze_bgr: resized to %s", image_bgr.shape)
 
     cv_results = {
         "sharpness": check_blur(image_bgr),
         "exposure": check_exposure(image_bgr),
     }
+    logger.debug("analyze_bgr: cv_results sharpness=%s exposure=%s",
+                 cv_results["sharpness"]["verdict"], cv_results["exposure"]["verdict"])
 
     image_b64 = encode_image_to_base64(image_bgr)
     llm_result = await call_vllm(build_llm_prompt(image_b64, criteria))
@@ -111,14 +136,18 @@ async def analyze_bgr(
     assessment = validate_and_clamp(llm_result.get("assessment", {}), criteria)
 
     per_criterion = assessment.get("per_criterion_scores", {})
+    merged = []
     for cv_name, cv_result in cv_results.items():
         if cv_name not in per_criterion:
             per_criterion[cv_name] = cv_result
+            merged.append(cv_name)
+    if merged:
+        logger.debug("analyze_bgr: merged CV results for: %s", merged)
 
     cv_failures = sum(1 for r in cv_results.values() if r["verdict"] == "FAIL")
     cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
 
-    return {
+    result = {
         "image_info": {
             "width": original_w, "height": original_h,
             "format": content_type, "size_bytes": size_bytes,
@@ -128,27 +157,56 @@ async def analyze_bgr(
         "llm_assessment": assessment,
         "combined_verdict": cv_verdict if not assessment.get("overall_verdict") else assessment["overall_verdict"],
     }
+    logger.info("analyze_bgr: returning combined_verdict=%s cv_verdict=%s llm_verdict=%s",
+                result["combined_verdict"], cv_verdict, assessment.get("overall_verdict"))
+    return result
 
 
 async def analyze_upload(upload: UploadFile, criteria: list[CriterionInput]) -> dict:
+    logger.info("analyze_upload: filename=%s content_type=%s criteria=%s",
+                upload.filename, upload.content_type, [c.name for c in criteria])
+
     if not upload.content_type or upload.content_type.split("/")[1] not in ("jpeg", "jpg", "png"):
+        logger.error("analyze_upload: unsupported content_type=%s", upload.content_type)
         raise HTTPException(status_code=400, detail=f"Only JPEG/PNG accepted (got {upload.content_type})")
+
     contents = await upload.read()
     if not contents:
+        logger.error("analyze_upload: empty file received")
         raise HTTPException(status_code=400, detail="Empty image file")
+
+    logger.debug("analyze_upload: read %d bytes", len(contents))
     bgr = await _bytes_to_bgr(contents)
     h, w = bgr.shape[:2]
-    return await analyze_bgr(bgr, w, h, upload.content_type, len(contents), criteria)
+    result = await analyze_bgr(bgr, w, h, upload.content_type, len(contents), criteria)
+
+    logger.info("analyze_upload: returning combined_verdict=%s", result["combined_verdict"])
+    return result
 
 
 async def analyze_input(img: ImageInput, criteria: list[CriterionInput]) -> dict:
+    data_repr = img.data[:80] if img.type == "url" else f"base64[{len(img.data)} chars]"
+    logger.info("analyze_input: type=%s data=%s criteria=%s",
+                img.type, data_repr, [c.name for c in criteria])
+
     bgr = await _load_bgr_from_input(img.data, img.type)
     h, w = bgr.shape[:2]
     size = len(base64.b64decode(img.data)) if img.type == "base64" else 0
-    return await analyze_bgr(bgr, w, h, "image/jpeg", size, criteria)
+    result = await analyze_bgr(bgr, w, h, "image/jpeg", size, criteria)
+
+    logger.info("analyze_input: returning combined_verdict=%s", result["combined_verdict"])
+    return result
 
 
 async def resolve_example(example: ExampleInput, criteria: list[CriterionInput]) -> dict:
-    if example.pre_generated_analysis is not None:
+    pre_generated = example.pre_generated_analysis is not None
+    logger.info("resolve_example: type=%s weight=%s pre_generated=%s criteria=%s",
+                example.type, example.weight, pre_generated, [c.name for c in criteria])
+
+    if pre_generated:
+        logger.info("resolve_example: using pre-generated analysis, skipping LLM call")
         return example.pre_generated_analysis
-    return await analyze_input(ImageInput(data=example.data, type=example.type), criteria)
+
+    result = await analyze_input(ImageInput(data=example.data, type=example.type), criteria)
+    logger.info("resolve_example: returning combined_verdict=%s", result["combined_verdict"])
+    return result

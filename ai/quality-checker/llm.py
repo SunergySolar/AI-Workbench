@@ -7,6 +7,7 @@ import httpx
 from fastapi import HTTPException
 
 from config import VLLM_QWEN_VL_API, MAX_LLM_RETRIES, HTTP_TIMEOUT, HTTP_CONNECT_TIMEOUT
+from logger import logger
 from models import CriterionInput
 
 _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
@@ -18,12 +19,18 @@ _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 
 def encode_image_to_base64(image) -> str:
     import cv2
+    logger.debug("encode_image_to_base64: image shape=%s", image.shape)
     _, buf = cv2.imencode(".jpg", image)
-    return base64.b64encode(buf).decode("utf-8")
+    result = base64.b64encode(buf).decode("utf-8")
+    logger.debug("encode_image_to_base64: returning base64[%d chars]", len(result))
+    return result
 
 
 def _verdict_from_score(score: int) -> str:
-    return "PASS" if score >= 7 else ("MARGINAL" if score >= 4 else "FAIL")
+    logger.debug("_verdict_from_score: score=%s", score)
+    verdict = "PASS" if score >= 7 else ("MARGINAL" if score >= 4 else "FAIL")
+    logger.debug("_verdict_from_score: returning %s", verdict)
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +38,9 @@ def _verdict_from_score(score: int) -> str:
 # ---------------------------------------------------------------------------
 
 def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
+    logger.debug("build_llm_prompt: image_b64[%d chars] criteria=%s",
+                 len(image_b64), [c.name for c in criteria])
+
     quality_criteria = [c for c in criteria if c.type == "quality"]
     feature_criteria = [c for c in criteria if c.type == "feature"]
 
@@ -54,7 +64,6 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         )
 
     criteria_text = "\n\n".join(sections)
-
     system_prompt = (
         "You are an image assessment expert. "
         "Analyze the provided image against each criterion listed below. "
@@ -75,7 +84,7 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "Set confidence to a number 0-100: 0 = completely uncertain, 100 = completely certain."
     )
 
-    return {
+    prompt = {
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -88,6 +97,9 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
+    logger.debug("build_llm_prompt: returning prompt with %d message(s), %d quality + %d feature criteria",
+                 len(prompt["messages"]), len(quality_criteria), len(feature_criteria))
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +107,12 @@ def build_llm_prompt(image_b64: str, criteria: list[CriterionInput]) -> dict:
 # ---------------------------------------------------------------------------
 
 async def call_vllm(prompt: dict) -> dict:
-    """Async vLLM call with retry on parse/structure failures.
+    logger.info("call_vllm: posting to %s (max_retries=%d)", VLLM_QWEN_VL_API, MAX_LLM_RETRIES)
 
-    Retries up to MAX_LLM_RETRIES times on JSON decode or missing-key errors.
-    HTTP errors from vLLM are raised immediately without retry.
-    """
     last_exc: Exception | None = None
 
     for attempt in range(MAX_LLM_RETRIES):
+        logger.info("call_vllm: attempt %d/%d", attempt + 1, MAX_LLM_RETRIES)
         try:
             async with httpx.AsyncClient(timeout=_http_timeout) as client:
                 response = await client.post(VLLM_QWEN_VL_API, json=prompt)
@@ -110,8 +120,8 @@ async def call_vllm(prompt: dict) -> dict:
                 data = response.json()
 
             content = data["choices"][0]["message"]["content"]
+            logger.debug("call_vllm: raw response content[%d chars]", len(content))
 
-            # json_object mode guarantees valid JSON; keep regex as fallback
             try:
                 result = json.loads(content)
             except json.JSONDecodeError:
@@ -123,24 +133,29 @@ async def call_vllm(prompt: dict) -> dict:
             if "assessment" not in result:
                 raise ValueError(f"Response missing 'assessment' key: {content[:200]}")
 
+            verdict = result.get("assessment", {}).get("overall_verdict", "unknown")
+            score = result.get("assessment", {}).get("overall_score", "unknown")
+            logger.info("call_vllm: returning overall_verdict=%s overall_score=%s", verdict, score)
             return result
 
         except httpx.HTTPError as exc:
+            logger.error("call_vllm: HTTP error on attempt %d: %s", attempt + 1, exc)
             raise HTTPException(status_code=502, detail=f"vLLM call failed: {exc}")
         except (KeyError, IndexError) as exc:
+            logger.error("call_vllm: unexpected response format on attempt %d: %s", attempt + 1, exc)
             raise HTTPException(status_code=502, detail=f"Unexpected vLLM response format: {exc}")
         except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("call_vllm: parse failure on attempt %d: %s", attempt + 1, exc)
             last_exc = exc
 
+    logger.error("call_vllm: all %d attempts failed, returning error sentinel", MAX_LLM_RETRIES)
     return {
         "assessment": {
             "overall_verdict": "FAIL",
             "overall_score": 1,
             "per_criterion_scores": {
                 "_llm_error": {
-                    "score": 1,
-                    "verdict": "FAIL",
-                    "confidence": 0,
+                    "score": 1, "verdict": "FAIL", "confidence": 0,
                     "reason": f"LLM parsing failed after {MAX_LLM_RETRIES} attempts: {last_exc}",
                 }
             },
@@ -155,10 +170,11 @@ async def call_vllm(prompt: dict) -> dict:
 def _normalize_criterion_keys(
     per_criterion: dict, criteria: list[CriterionInput]
 ) -> dict:
-    """Fuzzy-match LLM-returned criterion keys back to the requested names."""
     requested_names = [c.name for c in criteria]
-    normalized: dict = {}
+    logger.debug("_normalize_criterion_keys: returned_keys=%s requested=%s",
+                 list(per_criterion.keys()), requested_names)
 
+    normalized: dict = {}
     for returned_key, value in per_criterion.items():
         if returned_key in requested_names:
             normalized[returned_key] = value
@@ -167,23 +183,34 @@ def _normalize_criterion_keys(
         lower = returned_key.lower().strip()
         exact_ci = next((n for n in requested_names if n.lower().strip() == lower), None)
         if exact_ci:
+            if exact_ci != returned_key:
+                logger.debug("_normalize_criterion_keys: case-insensitive match '%s' -> '%s'",
+                             returned_key, exact_ci)
             normalized[exact_ci] = value
             continue
 
         close = difflib.get_close_matches(returned_key, requested_names, n=1, cutoff=0.6)
-        normalized[close[0] if close else returned_key] = value
+        if close:
+            logger.debug("_normalize_criterion_keys: fuzzy match '%s' -> '%s'", returned_key, close[0])
+            normalized[close[0]] = value
+        else:
+            logger.warning("_normalize_criterion_keys: no match found for '%s', keeping as-is", returned_key)
+            normalized[returned_key] = value
 
+    logger.debug("_normalize_criterion_keys: returning normalized_keys=%s", list(normalized.keys()))
     return normalized
 
 
 def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict:
-    """Clamp scores and confidence to valid ranges, recompute verdicts from scores,
-    and normalise criterion keys.
-    """
+    logger.info("validate_and_clamp: raw overall_score=%s overall_verdict=%s criteria=%s",
+                assessment.get("overall_score"), assessment.get("overall_verdict"),
+                [c.name for c in criteria])
+
     raw_score = assessment.get("overall_score", 5)
     try:
         overall_score = max(1, min(10, int(raw_score)))
     except (TypeError, ValueError):
+        logger.warning("validate_and_clamp: invalid overall_score=%r, defaulting to 5", raw_score)
         overall_score = 5
     assessment["overall_score"] = overall_score
     assessment["overall_verdict"] = _verdict_from_score(overall_score)
@@ -191,21 +218,25 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
     per_criterion = _normalize_criterion_keys(
         assessment.get("per_criterion_scores", {}), criteria
     )
-
-    for val in per_criterion.values():
+    for key, val in per_criterion.items():
         if not isinstance(val, dict):
             continue
         try:
             score = max(1, min(10, int(val.get("score", 5))))
         except (TypeError, ValueError):
+            logger.warning("validate_and_clamp: invalid score for '%s', defaulting to 5", key)
             score = 5
         try:
             confidence = max(0, min(100, int(val.get("confidence", 50))))
         except (TypeError, ValueError):
+            logger.warning("validate_and_clamp: invalid confidence for '%s', defaulting to 50", key)
             confidence = 50
         val["score"] = score
         val["confidence"] = confidence
         val["verdict"] = _verdict_from_score(score)
 
     assessment["per_criterion_scores"] = per_criterion
+    logger.info("validate_and_clamp: returning overall_score=%s overall_verdict=%s keys=%s",
+                assessment["overall_score"], assessment["overall_verdict"],
+                list(per_criterion.keys()))
     return assessment
