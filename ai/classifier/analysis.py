@@ -504,11 +504,9 @@ async def analyze_bgr(
         "verdict": combined_verdict,  # final verdict
     }
     logger.info(
-        "analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
-        result["combined_verdict"],
-        cv_assessment.get("overall_verdict", "n/a"),
-        llm_assessment.get("overall_verdict", "n/a"),
-        combined_assessment.get("overall_verdict", "n/a"),
+        "analyze_bgr: returning verdict=%s overall_score=%s",
+        result["verdict"],
+        combined_assessment.get("overall_score", "n/a"),
     )
     return result
 
