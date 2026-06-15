@@ -49,14 +49,15 @@ _http_timeout = httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT)
 
 # Known JPEG and PNG file signatures (magic bytes at the start of the file)
 _MAGIC_BYTES = {
-    b'\xff\xd8\xff': "JPEG",
-    b'\x89PNG\r\n\x1a\n': "PNG",
+    b"\xff\xd8\xff": "JPEG",
+    b"\x89PNG\r\n\x1a\n": "PNG",
 }
 
 
 # ---------------------------------------------------------------------------
 # Criteria parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_criteria(raw: str) -> list[CriterionInput]:
     """Parse and validate the criteria JSON string from a multipart form field.
@@ -91,13 +92,18 @@ def parse_criteria(raw: str) -> list[CriterionInput]:
                 '[{"name": "image sharpness", "type": "quality"}]'
             ),
         )
-    logger.info("parse_criteria: returning %d criteria: %s", len(result), [c.name for c in result])
+    logger.info(
+        "parse_criteria: returning %d criteria: %s",
+        len(result),
+        [c.name for c in result],
+    )
     return result
 
 
 # ---------------------------------------------------------------------------
 # Image loading helpers
 # ---------------------------------------------------------------------------
+
 
 def _validate_image_dimensions(w: int, h: int) -> None:
     """Reject images that are too small to produce meaningful assessments.
@@ -111,8 +117,13 @@ def _validate_image_dimensions(w: int, h: int) -> None:
     Raises:
         HTTPException(400): If either dimension is below the configured minimum.
     """
-    logger.debug("_validate_image_dimensions: w=%d h=%d (min %dx%d)",
-                 w, h, MIN_IMAGE_WIDTH, MIN_IMAGE_HEIGHT)
+    logger.debug(
+        "_validate_image_dimensions: w=%d h=%d (min %dx%d)",
+        w,
+        h,
+        MIN_IMAGE_WIDTH,
+        MIN_IMAGE_HEIGHT,
+    )
     if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
         logger.warning("_validate_image_dimensions: image too small (%dx%d)", w, h)
         raise HTTPException(
@@ -137,10 +148,14 @@ def _validate_magic_bytes(raw: bytes) -> None:
     """
     logger.debug("_validate_magic_bytes: checking %d bytes", len(raw))
     for magic in _MAGIC_BYTES:
-        if raw[:len(magic)] == magic:
-            logger.debug("_validate_magic_bytes: valid %s signature", _MAGIC_BYTES[magic])
+        if raw[: len(magic)] == magic:
+            logger.debug(
+                "_validate_magic_bytes: valid %s signature", _MAGIC_BYTES[magic]
+            )
             return
-    logger.warning("_validate_magic_bytes: unrecognised file signature: %s", raw[:8].hex())
+    logger.warning(
+        "_validate_magic_bytes: unrecognised file signature: %s", raw[:8].hex()
+    )
     raise HTTPException(
         status_code=400,
         detail="File does not appear to be a valid JPEG or PNG image.",
@@ -168,6 +183,7 @@ async def _bytes_to_bgr(raw: bytes):
         HTTPException(400): If magic bytes are invalid or decoding fails entirely.
     """
     import cv2
+
     logger.debug("_bytes_to_bgr: decoding %d bytes", len(raw))
 
     # Step 1 — reject obviously wrong file formats early
@@ -180,10 +196,14 @@ async def _bytes_to_bgr(raw: bytes):
         # Step 3 — convert to BGR for all downstream OpenCV operations
         rgb = np.array(pil_img.convert("RGB"))
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        logger.debug("_bytes_to_bgr: PIL decode + EXIF correction succeeded shape=%s", bgr.shape)
+        logger.debug(
+            "_bytes_to_bgr: PIL decode + EXIF correction succeeded shape=%s", bgr.shape
+        )
     except Exception as exc:
         # Step 4 — PIL failed; fall back to cv2 (no EXIF correction)
-        logger.warning("_bytes_to_bgr: PIL EXIF correction failed (%s), falling back to cv2", exc)
+        logger.warning(
+            "_bytes_to_bgr: PIL EXIF correction failed (%s), falling back to cv2", exc
+        )
         nparr = np.frombuffer(raw, np.uint8)
         bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -233,8 +253,12 @@ async def _load_bgr_from_input(data: str, type_: str):
                 raw = r.content
             logger.debug("_load_bgr_from_input: fetched %d bytes from URL", len(raw))
         except httpx.HTTPError as exc:
-            logger.error("_load_bgr_from_input: failed to fetch URL '%s': %s", data[:80], exc)
-            raise HTTPException(status_code=502, detail=f"Failed to fetch image URL: {exc}")
+            logger.error(
+                "_load_bgr_from_input: failed to fetch URL '%s': %s", data[:80], exc
+            )
+            raise HTTPException(
+                status_code=502, detail=f"Failed to fetch image URL: {exc}"
+            )
 
     bgr = await _bytes_to_bgr(raw)
     logger.debug("_load_bgr_from_input: returning image shape=%s", bgr.shape)
@@ -244,6 +268,7 @@ async def _load_bgr_from_input(data: str, type_: str):
 # ---------------------------------------------------------------------------
 # Weighted score calculation
 # ---------------------------------------------------------------------------
+
 
 def compute_weighted_score(assessment: dict, criteria: list[CriterionInput]) -> dict:
     """Compute the weighted overall score and attach the breakdown to the assessment.
@@ -276,35 +301,39 @@ def compute_weighted_score(assessment: dict, criteria: list[CriterionInput]) -> 
         logger.warning("compute_weighted_score: total_weight is 0 — skipping")
         return assessment
 
-    weighted_sum   = sum(val["score"] * c.weight for c, val in matched)
-    unrounded      = weighted_sum / total_weight
+    weighted_sum = sum(val["score"] * c.weight for c, val in matched)
+    unrounded = weighted_sum / total_weight
     weighted_score = max(1, min(10, round(unrounded)))
 
-    assessment["overall_score"]   = weighted_score
+    assessment["overall_score"] = weighted_score
     assessment["overall_verdict"] = _verdict_from_score(weighted_score)
     assessment["weighted_score_breakdown"] = {
-        "formula":           "sum(score * weight) / total_weight",
-        "total_weight":      round(total_weight, 4),
-        "weighted_sum":      round(weighted_sum, 4),
+        "formula": "sum(score * weight) / total_weight",
+        "total_weight": round(total_weight, 4),
+        "weighted_sum": round(weighted_sum, 4),
         "unrounded_average": round(unrounded, 4),
-        "final_score":       weighted_score,
+        "final_score": weighted_score,
         "per_criterion": {
             c.name: {
-                "score":        val["score"],
-                "weight":       c.weight,
+                "score": val["score"],
+                "weight": c.weight,
                 "contribution": round(val["score"] * c.weight, 4),
             }
             for c, val in matched
         },
     }
-    logger.info("compute_weighted_score: final_score=%s weights=%s",
-                weighted_score, {c.name: c.weight for c, _ in matched})
+    logger.info(
+        "compute_weighted_score: final_score=%s weights=%s",
+        weighted_score,
+        {c.name: c.weight for c, _ in matched},
+    )
     return assessment
 
 
 # ---------------------------------------------------------------------------
 # Core analysis pipeline
 # ---------------------------------------------------------------------------
+
 
 async def analyze_bgr(
     image_bgr,
@@ -341,8 +370,15 @@ async def analyze_bgr(
         llm_assessment, and combined_verdict.
     """
     import cv2
-    logger.info("analyze_bgr: image=%dx%d content_type=%s size=%d bytes criteria=%s",
-                original_w, original_h, content_type, size_bytes, [c.name for c in criteria])
+
+    logger.info(
+        "analyze_bgr: image=%dx%d content_type=%s size=%d bytes criteria=%s",
+        original_w,
+        original_h,
+        content_type,
+        size_bytes,
+        [c.name for c in criteria],
+    )
 
     # Step 1 — reject images that are too small for reliable assessment
     _validate_image_dimensions(original_w, original_h)
@@ -352,7 +388,8 @@ async def analyze_bgr(
     if max(original_h, original_w) > max_dim:
         scale = max_dim / max(original_h, original_w)
         image_bgr = cv2.resize(
-            image_bgr, (int(original_w * scale), int(original_h * scale)),
+            image_bgr,
+            (int(original_w * scale), int(original_h * scale)),
             interpolation=cv2.INTER_AREA,
         )
         logger.debug("analyze_bgr: resized to %s", image_bgr.shape)
@@ -360,7 +397,7 @@ async def analyze_bgr(
     # Step 3 — partition criteria and run CV detectors for type="cv" criteria.
     # For each cv criterion: look up the detector by name → run it if found,
     # fall back to LLM if not.  type="llm" criteria always go to the LLM.
-    cv_criteria  = [c for c in criteria if c.type == "cv"]
+    cv_criteria = [c for c in criteria if c.type == "cv"]
     llm_criteria = [c for c in criteria if c.type == "llm"]
 
     # Collect per-criterion CV results in a temporary dict first so we can
@@ -375,25 +412,37 @@ async def analyze_bgr(
             _cv_per_criterion[c.name] = result_dict
         else:
             # No registered detector — fall back to LLM transparently
-            logger.warning("analyze_bgr: no CV detector for '%s', falling back to LLM", c.name)
+            logger.warning(
+                "analyze_bgr: no CV detector for '%s', falling back to LLM", c.name
+            )
             llm_criteria.append(c)
 
     # Compute CV overall verdict and score immediately after all detectors have run,
     # then build cv_assessment with overall_verdict and overall_score first so they
     # appear at the top of the dict.
     if _cv_per_criterion:
-        cv_scores   = [r["score"] for r in _cv_per_criterion.values()
-                       if isinstance(r.get("score"), (int, float))]
-        cv_failures = sum(1 for r in _cv_per_criterion.values() if r.get("verdict") == "FAIL")
-        cv_verdict  = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
+        cv_scores = [
+            r["score"]
+            for r in _cv_per_criterion.values()
+            if isinstance(r.get("score"), (int, float))
+        ]
+        cv_failures = sum(
+            1 for r in _cv_per_criterion.values() if r.get("verdict") == "FAIL"
+        )
+        cv_verdict = (
+            "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
+        )
         cv_assessment: dict = {
-            "overall_verdict":      cv_verdict,
-            "overall_score":        round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5,
+            "overall_verdict": cv_verdict,
+            "overall_score": round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5,
             "per_criterion_scores": _cv_per_criterion,
         }
-        logger.debug("analyze_bgr: cv_assessment verdict=%s score=%s criteria=%s",
-                     cv_assessment["overall_verdict"], cv_assessment["overall_score"],
-                     {k: v["verdict"] for k, v in _cv_per_criterion.items()})
+        logger.debug(
+            "analyze_bgr: cv_assessment verdict=%s score=%s criteria=%s",
+            cv_assessment["overall_verdict"],
+            cv_assessment["overall_score"],
+            {k: v["verdict"] for k, v in _cv_per_criterion.items()},
+        )
     else:
         cv_assessment: dict = {}
 
@@ -404,15 +453,20 @@ async def analyze_bgr(
     # Skip the LLM call entirely if every criterion resolved via CV.
     if llm_criteria:
         llm_raw = await call_vllm(build_llm_prompt(image_b64, llm_criteria))
-        for val in llm_raw.get("assessment", {}).get("per_criterion_scores", {}).values():
+        for val in (
+            llm_raw.get("assessment", {}).get("per_criterion_scores", {}).values()
+        ):
             if isinstance(val, dict):
                 val["method"] = "llm"
         # Validate and clamp LLM assessment using only the LLM-bound criteria.
         llm_assessment = validate_and_clamp(llm_raw.get("assessment", {}), llm_criteria)
     else:
         logger.info("analyze_bgr: all criteria resolved via CV — skipping LLM call")
-        llm_assessment = {"overall_verdict": None, "overall_score": None,
-                          "per_criterion_scores": {}}
+        llm_assessment = {
+            "overall_verdict": None,
+            "overall_score": None,
+            "per_criterion_scores": {},
+        }
 
     # Step 5b — build combined assessment (CV + LLM) and compute the weighted
     # overall score across ALL criteria.  CV and LLM each stay clean in their
@@ -433,26 +487,29 @@ async def analyze_bgr(
     # final_score so the connection between score and verdict is explicit.
     breakdown = combined_assessment.get("weighted_score_breakdown", {})
     combined_verdict = combined_assessment.get("overall_verdict", "PASS")
-    logger.debug("analyze_bgr: combined breakdown final_score=%s → verdict=%s",
-                 breakdown.get("final_score"), combined_verdict)
+    logger.debug(
+        "analyze_bgr: combined breakdown final_score=%s → verdict=%s",
+        breakdown.get("final_score"),
+        combined_verdict,
+    )
 
     result = {
         "image_info": {
-            "width": original_w, "height": original_h,
-            "format": content_type, "size_bytes": size_bytes,
+            "width": original_w,
+            "height": original_h,
+            "format": content_type,
+            "size_bytes": size_bytes,
         },
-        "assessment": {
-            "cv":       cv_assessment,       # CV-only: overall_verdict, overall_score, per-criterion
-            "llm":      llm_assessment,      # LLM-only: overall_verdict, overall_score, per-criterion
-            "combined": combined_assessment, # all criteria + weighted_score_breakdown
-        },
-        "combined_verdict": combined_verdict,
+        "assessment": combined_assessment,  # combined assessment with all criteria and weighted score
+        "combined_verdict": combined_verdict,  # final verdict
     }
-    logger.info("analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
-                result["combined_verdict"],
-                cv_assessment.get("overall_verdict", "n/a"),
-                llm_assessment.get("overall_verdict", "n/a"),
-                combined_assessment.get("overall_verdict", "n/a"))
+    logger.info(
+        "analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
+        result["combined_verdict"],
+        cv_assessment.get("overall_verdict", "n/a"),
+        llm_assessment.get("overall_verdict", "n/a"),
+        combined_assessment.get("overall_verdict", "n/a"),
+    )
     return result
 
 
@@ -469,12 +526,23 @@ async def analyze_upload(upload: UploadFile, criteria: list[CriterionInput]) -> 
     Returns:
         Analysis result dict from analyze_bgr().
     """
-    logger.info("analyze_upload: filename=%s content_type=%s criteria=%s",
-                upload.filename, upload.content_type, [c.name for c in criteria])
+    logger.info(
+        "analyze_upload: filename=%s content_type=%s criteria=%s",
+        upload.filename,
+        upload.content_type,
+        [c.name for c in criteria],
+    )
 
     # Validate content type before reading the entire file into memory
-    if not upload.content_type or upload.content_type.split("/")[1] not in ("jpeg", "jpg", "png"):
-        raise HTTPException(status_code=400, detail=f"Only JPEG/PNG accepted (got {upload.content_type})")
+    if not upload.content_type or upload.content_type.split("/")[1] not in (
+        "jpeg",
+        "jpg",
+        "png",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only JPEG/PNG accepted (got {upload.content_type})",
+        )
 
     contents = await upload.read()
     if not contents:
@@ -484,7 +552,9 @@ async def analyze_upload(upload: UploadFile, criteria: list[CriterionInput]) -> 
     bgr = await _bytes_to_bgr(contents)
     h, w = bgr.shape[:2]
     result = await analyze_bgr(bgr, w, h, upload.content_type, len(contents), criteria)
-    logger.info("analyze_upload: returning combined_verdict=%s", result["combined_verdict"])
+    logger.info(
+        "analyze_upload: returning combined_verdict=%s", result["combined_verdict"]
+    )
     return result
 
 
@@ -501,18 +571,26 @@ async def analyze_input(img: ImageInput, criteria: list[CriterionInput]) -> dict
         Analysis result dict from analyze_bgr().
     """
     data_repr = img.data[:80] if img.type == "url" else f"base64[{len(img.data)} chars]"
-    logger.info("analyze_input: type=%s data=%s criteria=%s",
-                img.type, data_repr, [c.name for c in criteria])
+    logger.info(
+        "analyze_input: type=%s data=%s criteria=%s",
+        img.type,
+        data_repr,
+        [c.name for c in criteria],
+    )
     bgr = await _load_bgr_from_input(img.data, img.type)
     h, w = bgr.shape[:2]
     # Calculate size from base64 length (3 base64 chars ≈ 2 bytes)
     size = len(base64.b64decode(img.data)) if img.type == "base64" else 0
     result = await analyze_bgr(bgr, w, h, "image/jpeg", size, criteria)
-    logger.info("analyze_input: returning combined_verdict=%s", result["combined_verdict"])
+    logger.info(
+        "analyze_input: returning combined_verdict=%s", result["combined_verdict"]
+    )
     return result
 
 
-async def resolve_example(example: ExampleInput, criteria: list[CriterionInput]) -> dict:
+async def resolve_example(
+    example: ExampleInput, criteria: list[CriterionInput]
+) -> dict:
     """Return the analysis for a reference example, live or pre-generated.
 
     Used in /assess/compare to obtain an analysis for each reference image.
@@ -528,8 +606,13 @@ async def resolve_example(example: ExampleInput, criteria: list[CriterionInput])
         Analysis result dict (same shape as analyze_bgr output).
     """
     pre_generated = example.pre_generated_analysis is not None
-    logger.info("resolve_example: type=%s weight=%s pre_generated=%s criteria=%s",
-                example.type, example.weight, pre_generated, [c.name for c in criteria])
+    logger.info(
+        "resolve_example: type=%s weight=%s pre_generated=%s criteria=%s",
+        example.type,
+        example.weight,
+        pre_generated,
+        [c.name for c in criteria],
+    )
 
     if pre_generated:
         # Skip the LLM entirely — use the cached result
@@ -537,6 +620,10 @@ async def resolve_example(example: ExampleInput, criteria: list[CriterionInput])
         return example.pre_generated_analysis
 
     # Analyse live — same path as a regular /assess call
-    result = await analyze_input(ImageInput(data=example.data, type=example.type), criteria)
-    logger.info("resolve_example: returning combined_verdict=%s", result["combined_verdict"])
+    result = await analyze_input(
+        ImageInput(data=example.data, type=example.type), criteria
+    )
+    logger.info(
+        "resolve_example: returning combined_verdict=%s", result["combined_verdict"]
+    )
     return result
