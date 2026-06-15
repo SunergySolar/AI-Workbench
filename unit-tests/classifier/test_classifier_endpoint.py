@@ -141,7 +141,7 @@ def print_result(job: dict, criteria: list = None) -> None:
         cv         = assessment.get("cv",       {})
         llm        = assessment.get("llm",      {})
         combined   = assessment.get("combined", {})
-        cv_criteria = {k: v for k, v in cv.items() if isinstance(v, dict)}
+        cv_criteria = cv.get("per_criterion_scores", {})
 
         print(f"\n{'-' * 60}")
         print(f"  Combined verdict : {result.get('combined_verdict', 'n/a')} "

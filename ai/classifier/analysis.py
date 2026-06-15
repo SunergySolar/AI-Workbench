@@ -387,9 +387,9 @@ async def analyze_bgr(
         cv_failures = sum(1 for r in _cv_per_criterion.values() if r.get("verdict") == "FAIL")
         cv_verdict  = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
         cv_assessment: dict = {
-            "overall_verdict": cv_verdict,
-            "overall_score":   round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5,
-            **_cv_per_criterion,
+            "overall_verdict":      cv_verdict,
+            "overall_score":        round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5,
+            "per_criterion_scores": _cv_per_criterion,
         }
         logger.debug("analyze_bgr: cv_assessment verdict=%s score=%s criteria=%s",
                      cv_assessment["overall_verdict"], cv_assessment["overall_score"],
@@ -417,12 +417,11 @@ async def analyze_bgr(
     # Step 5b — build combined assessment (CV + LLM) and compute the weighted
     # overall score across ALL criteria.  CV and LLM each stay clean in their
     # own keys; combined is the single source for the weighted breakdown.
-    cv_criterion_scores = {k: v for k, v in cv_assessment.items() if isinstance(v, dict)}
     combined_raw = {
         "overall_verdict": "...",
         "overall_score": 0,
         "per_criterion_scores": {
-            **cv_criterion_scores,
+            **cv_assessment.get("per_criterion_scores", {}),
             **llm_assessment.get("per_criterion_scores", {}),
         },
     }

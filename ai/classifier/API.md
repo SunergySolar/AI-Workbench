@@ -166,7 +166,7 @@ Assess an input image against one or more reference examples. Each example has i
 | `data` | string | Yes* | — | Base64-encoded image or a URL |
 | `type` | `base64` \| `url` | Yes* | — | How to interpret `data` |
 | `weight` | float (0.0–1.0) | No | `0.5` | How much similarity to this example affects its combined score.<br>`0.0` = ignore example, use only absolute quality score.<br>`1.0` = ignore absolute quality, use only similarity score. |
-| `pre_generated_analysis` | object | No | `null` | A prior analysis result (from any endpoint's `example_analysis` or `example_results[n].example_analysis`). When provided, the LLM call for this example is skipped entirely. |
+| `pre_generated_analysis` | object | No | `null` | A prior analysis result (from `example_results[n].example_analysis` or a `/assess` response). Skips the LLM call for this example. **Must be from the same classifier version** — see caching note below. |
 
 \* Not required if `pre_generated_analysis` is provided and you don't need the image re-analysed.
 
@@ -319,6 +319,8 @@ Re-analysing the same reference image on every request wastes LLM tokens. The re
 2. Pass the saved response as `pre_generated_analysis` in subsequent `/assess/compare` calls.
 
 The `pre_generated_analysis` field accepts the full object returned under `example_results[n].example_analysis` in any compare response, or the root-level response from `/assess`.
+
+> **Compatibility warning:** `pre_generated_analysis` values must come from the same version of the classifier that is currently running. The internal response structure (e.g. the shape of `assessment.combined`) can change between releases. A stored analysis generated against an older version will cause a runtime error when the compare endpoint tries to access fields that have moved or been renamed. Always re-generate stored analyses after upgrading the classifier.
 
 ---
 
