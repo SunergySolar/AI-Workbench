@@ -327,7 +327,7 @@ def apply_dependencies(assessment: dict, criteria: list[CriterionInput]) -> dict
                     "score":      None,
                     "confidence": None,
                     "reason":     (
-                        f"Skipped — dependency '{depends_on_name}' "
+                        f"Skipped - dependency '{depends_on_name}' "
                         f"did not pass (verdict: {dep_verdict})."
                     ),
                     "method":     "skipped",
