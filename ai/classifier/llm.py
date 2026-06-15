@@ -465,7 +465,7 @@ def validate_and_clamp(assessment: dict, criteria: list[CriterionInput]) -> dict
             # Attach a full breakdown so callers can audit exactly how the
             # final score was derived from each criterion's score and weight
             assessment["weighted_score_breakdown"] = {
-                "formula": "sum(score × weight) / total_weight",
+                "formula": "sum(score * weight) / total_weight",
                 "total_weight": round(total_weight, 4),
                 "weighted_sum": round(weighted_sum, 4),
                 "unrounded_average": round(unrounded, 4),
