@@ -501,7 +501,7 @@ async def analyze_bgr(
             "size_bytes": size_bytes,
         },
         "assessment": combined_assessment,  # combined assessment with all criteria and weighted score
-        "combined_verdict": combined_verdict,  # final verdict
+        "verdict": combined_verdict,  # final verdict
     }
     logger.info(
         "analyze_bgr: returning combined_verdict=%s cv=%s llm=%s combined=%s",
