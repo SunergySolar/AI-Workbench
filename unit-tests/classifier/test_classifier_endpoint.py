@@ -15,6 +15,7 @@ Requires: pip install requests
 """
 
 import argparse
+import base64
 import json
 import sys
 import time
@@ -70,6 +71,11 @@ def fetch_cv_detectors(base_url: str, api_key: str) -> dict:
     return get(base_url, api_key, "/cv-detectors")
 
 
+def encode_image(image_path: Path) -> str:
+    """Base64-encode an image file for use in JSON request bodies."""
+    return base64.b64encode(image_path.read_bytes()).decode()
+
+
 def submit_job(base_url: str, api_key: str, image_path: Path, criteria: list) -> str:
     url = f"{base_url}/v1/classifier/assess"
     print(f"  POST {url}")
@@ -104,6 +110,48 @@ def poll_job(base_url: str, api_key: str, job_id: str, max_wait: int, poll_inter
             return data
 
     sys.exit(f"Timed out after {max_wait}s — last status: {status}")
+
+
+def submit_compare_job(
+    base_url: str,
+    api_key: str,
+    input_path: Path,
+    example_path: Path,
+    criteria: list,
+    example_weight: float = 0.5,
+    aggregation: str = "mean",
+    pre_generated_analysis: dict = None,
+) -> str:
+    """Submit a /assess/compare job and return the job ID.
+
+    If pre_generated_analysis is provided it is passed as the example's
+    pre_generated_analysis — skipping re-analysis of the example image.
+    The example image bytes are always included so the server has them if needed.
+    """
+    url = f"{base_url}/v1/classifier/assess/compare"
+    print(f"  POST {url}")
+
+    body = {
+        "image": {"data": encode_image(input_path), "type": "base64"},
+        "criteria": criteria,
+        "aggregation": aggregation,
+        "examples": [{
+            "data":                  encode_image(example_path),
+            "type":                  "base64",
+            "weight":                example_weight,
+            "pre_generated_analysis": pre_generated_analysis,
+        }],
+    }
+
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    if not resp.ok:
+        sys.exit(f"Compare submit failed ({resp.status_code}): {resp.text}")
+    return resp.json()["job_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +226,37 @@ def print_result(job: dict, criteria: list = None) -> None:
         sys.exit(1)
 
 
+def print_compare_result(job: dict, label: str = "") -> None:
+    if job["status"] == "completed":
+        result = job.get("result", {})
+        agg    = result.get("aggregate", {})
+
+        header = f"  Comparison result{f' — {label}' if label else ''}"
+        print(f"\n{'-' * 60}")
+        print(header)
+        print(f"  Aggregate verdict : {agg.get('combined_verdict', 'n/a')} "
+              f"(score {agg.get('combined_score', '-')}, method={agg.get('method', '-')})")
+        print(f"{'-' * 60}")
+
+        for ex in result.get("example_results", []):
+            pre = "pre-generated" if ex.get("pre_generated") else "live"
+            print(f"\n  Example {ex['index']}  weight={ex['weight']}  [{pre}]")
+            print(f"    Combined score   : {ex.get('combined_score', '-')} "
+                  f"→ {ex.get('combined_verdict', '-')}")
+            sim = ex.get("similarity", {})
+            print(f"    Overall sim      : {sim.get('overall_similarity', '-')} "
+                  f"(score {sim.get('similarity_score', '-')})")
+            for crit, vals in sim.get("per_criterion", {}).items():
+                print(f"      {crit:<35} sim={vals['similarity']:.3f}  "
+                      f"(example={vals['example_score']} / input={vals['input_score']})")
+
+        print("\n  Full JSON:")
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"\nCompare job failed: {job.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -236,6 +315,49 @@ def main() -> None:
     job = poll_job(args.base_url, api_key, job_id, args.max_wait, args.poll_interval)
 
     print_result(job, criteria)
+
+    # Save the assess result to use as pre_generated_analysis in the first comparison
+    prior_analysis = job.get("result")
+
+    # --- Comparison 1: example uses pre-generated analysis (no re-analysis) ---
+    print(f"\n{'=' * 60}")
+    print(f"  Comparison 1 — pre-generated example analysis")
+    print(f"{'=' * 60}")
+    print(f"\nInput   : {image.name}")
+    print(f"Example : {image.name}  [using cached analysis from assess above]")
+    print(f"Criteria: {[c['name'] for c in criteria]}\n")
+
+    print("Submitting compare job...")
+    cmp_id = submit_compare_job(
+        args.base_url, api_key, image, image, criteria,
+        example_weight=0.5,
+        pre_generated_analysis=prior_analysis,
+    )
+    print(f"Job ID  : {cmp_id}\n")
+
+    print("Polling for result...")
+    cmp_job = poll_job(args.base_url, api_key, cmp_id, args.max_wait, args.poll_interval)
+    print_compare_result(cmp_job, label="pre-generated example")
+
+    # --- Comparison 2: both images analyzed live, no pre-generated analysis ---
+    print(f"\n{'=' * 60}")
+    print(f"  Comparison 2 — fully live (both images re-analyzed)")
+    print(f"{'=' * 60}")
+    print(f"\nInput   : {image.name}")
+    print(f"Example : {image.name}  [analyzed live]")
+    print(f"Criteria: {[c['name'] for c in criteria]}\n")
+
+    print("Submitting compare job...")
+    cmp_id2 = submit_compare_job(
+        args.base_url, api_key, image, image, criteria,
+        example_weight=0.5,
+        pre_generated_analysis=None,
+    )
+    print(f"Job ID  : {cmp_id2}\n")
+
+    print("Polling for result...")
+    cmp_job2 = poll_job(args.base_url, api_key, cmp_id2, args.max_wait, args.poll_interval)
+    print_compare_result(cmp_job2, label="fully live")
 
 
 if __name__ == "__main__":

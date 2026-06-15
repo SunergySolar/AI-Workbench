@@ -551,7 +551,7 @@ async def analyze_upload(upload: UploadFile, criteria: list[CriterionInput]) -> 
     h, w = bgr.shape[:2]
     result = await analyze_bgr(bgr, w, h, upload.content_type, len(contents), criteria)
     logger.info(
-        "analyze_upload: returning combined_verdict=%s", result["combined_verdict"]
+        "analyze_upload: returning combined_verdict=%s", result["verdict"]
     )
     return result
 
@@ -581,7 +581,7 @@ async def analyze_input(img: ImageInput, criteria: list[CriterionInput]) -> dict
     size = len(base64.b64decode(img.data)) if img.type == "base64" else 0
     result = await analyze_bgr(bgr, w, h, "image/jpeg", size, criteria)
     logger.info(
-        "analyze_input: returning combined_verdict=%s", result["combined_verdict"]
+        "analyze_input: returning combined_verdict=%s", result["verdict"]
     )
     return result
 
@@ -622,6 +622,6 @@ async def resolve_example(
         ImageInput(data=example.data, type=example.type), criteria
     )
     logger.info(
-        "resolve_example: returning combined_verdict=%s", result["combined_verdict"]
+        "resolve_example: returning combined_verdict=%s", result["verdict"]
     )
     return result
