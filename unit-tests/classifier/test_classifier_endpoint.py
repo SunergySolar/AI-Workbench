@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Test the classifier /assess endpoint.
+Test the classifier endpoints.
 
-Submits an image as a job and polls until complete, then prints the result.
+Fetches available hints and CV detectors, then submits an image assessment
+job and polls until complete.
 
 Usage:
-    python test_quality_endpoint.py
-    python test_quality_endpoint.py --image path/to/image.jpg
-    python test_quality_endpoint.py --criteria '[{"name":"sharpness","type":"quality"},{"name":"has solar panels","type":"feature"}]'
-    python test_quality_endpoint.py --base-url http://192.168.5.233:4001 --max-wait 120
+    python test_classifier_endpoint.py
+    python test_classifier_endpoint.py --image path/to/image.jpg
+    python test_classifier_endpoint.py --criteria-file unit-tests/classifier/criteria.json
+    python test_classifier_endpoint.py --base-url http://192.168.5.233:4001 --max-wait 120
 
 Requires: pip install requests
 """
@@ -27,10 +28,10 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent
 
 DEFAULT_CRITERIA = [
-    {"name": "document legibility", "type": "quality"},
-    {"name": "image sharpness",     "type": "quality"},
-    {"name": "proper exposure",     "type": "quality"},
-    {"name": "absence of artifacts","type": "quality"},
+    {"name": "document legibility", "type": "llm", "hint": "quality"},
+    {"name": "image sharpness",     "type": "llm", "hint": "quality"},
+    {"name": "proper exposure",     "type": "llm", "hint": "quality"},
+    {"name": "absence of artifacts","type": "llm", "hint": "quality"},
 ]
 
 
@@ -46,11 +47,27 @@ def load_api_key() -> str:
             continue
         if line.startswith("DEFAULT_LITELLM_MASTER_KEY="):
             value = line.split("=", 1)[1].strip()
-            # Strip inline comments (e.g. key=sk-1234  # comment)
             if " #" in value:
                 value = value[:value.index(" #")].strip()
             return value
     sys.exit("ERROR: DEFAULT_LITELLM_MASTER_KEY not found in .env")
+
+
+def get(base_url: str, api_key: str, path: str) -> dict:
+    """Perform a GET request to the classifier API and return the JSON body."""
+    url = f"{base_url}/v1/classifier{path}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+    if not resp.ok:
+        sys.exit(f"GET {path} failed ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
+def fetch_hints(base_url: str, api_key: str) -> dict:
+    return get(base_url, api_key, "/hints")
+
+
+def fetch_cv_detectors(base_url: str, api_key: str) -> dict:
+    return get(base_url, api_key, "/cv-detectors")
 
 
 def submit_job(base_url: str, api_key: str, image_path: Path, criteria: list) -> str:
@@ -69,13 +86,7 @@ def submit_job(base_url: str, api_key: str, image_path: Path, criteria: list) ->
     return resp.json()["job_id"]
 
 
-def poll_job(
-    base_url: str,
-    api_key: str,
-    job_id: str,
-    max_wait: int,
-    poll_interval: int,
-) -> dict:
+def poll_job(base_url: str, api_key: str, job_id: str, max_wait: int, poll_interval: int) -> dict:
     url = f"{base_url}/v1/classifier/jobs/{job_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
     elapsed = 0
@@ -83,53 +94,81 @@ def poll_job(
     while elapsed < max_wait:
         time.sleep(poll_interval)
         elapsed += poll_interval
-
         resp = requests.get(url, headers=headers, timeout=10)
         if not resp.ok:
             sys.exit(f"Poll failed ({resp.status_code}): {resp.text}")
-
         data = resp.json()
         status = data["status"]
         print(f"  [{elapsed:>4}s] {status}", flush=True)
-
         if status in ("completed", "failed"):
             return data
 
     sys.exit(f"Timed out after {max_wait}s — last status: {status}")
 
 
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def print_hints(hints_data: dict) -> None:
+    hints = hints_data.get("hints", {})
+    print(f"\n{'=' * 60}")
+    print(f"  Available hints ({len(hints)})")
+    print(f"{'=' * 60}")
+    for name, defn in hints.items():
+        print(f"\n  [{name}]")
+        print(f"    {defn.get('heading', '')}")
+        print(f"    Rubric : {defn.get('rubric', '')}")
+        if defn.get("extra"):
+            print(f"    Extra  : {defn['extra']}")
+
+
+def print_cv_detectors(detectors_data: dict) -> None:
+    detectors = detectors_data.get("detectors", [])
+    total = detectors_data.get("total_names", 0)
+    print(f"\n{'=' * 60}")
+    print(f"  Registered CV detectors ({len(detectors)} functions, {total} names)")
+    print(f"{'=' * 60}")
+    for d in detectors:
+        names = ", ".join(d.get("names", []))
+        print(f"  {d['function']:<25}  {names}")
+
+
 def print_result(job: dict, criteria: list = None) -> None:
     if job["status"] == "completed":
-        result = job.get("result", {})
-        assessment = result.get("llm_assessment", {})
-        cv = result.get("cv_pre_checks", {})
+        result     = job.get("result", {})
+        assessment = result.get("assessment", {})
+        cv         = assessment.get("cv",  {})
+        llm        = assessment.get("llm", {})
+        cv_criteria = {k: v for k, v in cv.items() if isinstance(v, dict)}
 
         print(f"\n{'-' * 60}")
         print(f"  Combined verdict : {result.get('combined_verdict', 'n/a')}")
-        print(f"  CV sharpness     : {cv.get('sharpness', {}).get('verdict', 'n/a')} "
-              f"(score {cv.get('sharpness', {}).get('score', '-')})")
-        print(f"  CV exposure      : {cv.get('exposure', {}).get('verdict', 'n/a')} "
-              f"(score {cv.get('exposure', {}).get('score', '-')})")
-        print(f"  LLM overall      : {assessment.get('overall_verdict', 'n/a')} "
-              f"(score {assessment.get('overall_score', '-')})")
+        if cv_criteria:
+            print(f"  CV overall       : {cv.get('overall_verdict', 'n/a')} "
+                  f"(score {cv.get('overall_score', '-')})")
+            for name, val in cv_criteria.items():
+                print(f"    {name:<30} {val.get('verdict', '?')}  "
+                      f"score={val.get('score', '?')}")
+        print(f"  LLM overall      : {llm.get('overall_verdict', 'n/a')} "
+              f"(score {llm.get('overall_score', '-')})")
         print(f"{'-' * 60}")
 
-        per = assessment.get("per_criterion_scores", {})
+        per = llm.get("per_criterion_scores", {})
         if per:
             print("\n  Per-criterion scores:")
             for name, val in per.items():
                 if not isinstance(val, dict):
                     continue
-                conf = f"  confidence={val.get('confidence', '?')}"
-                weight = val.get("weight", "")
-                weight_str = f"  weight={weight}" if weight != "" else ""
+                method = val.get("method", "?")
+                conf   = f"  confidence={val.get('confidence', '?')}"
                 print(f"    {name:<35} {val.get('verdict', '?'):<10} "
-                      f"score={val.get('score', '?')}{conf}{weight_str}")
+                      f"score={val.get('score', '?')}{conf}  [{method}]")
                 reason = val.get("reason", "")
                 if reason:
                     print(f"      {reason}")
 
-        breakdown = assessment.get("weighted_score_breakdown")
+        breakdown = llm.get("weighted_score_breakdown")
         if breakdown:
             print(f"\n  Weighted score breakdown  ({breakdown.get('formula')})")
             print(f"  {'Criterion':<35} {'Score':>5}  {'Weight':>7}  {'Contribution':>12}")
@@ -155,60 +194,53 @@ def print_result(job: dict, criteria: list = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Submit an image to the classifier and print the result.",
+        description="Test the classifier API — fetches capabilities then runs an assessment.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--image", type=Path,
-        default=SCRIPT_DIR / "Neighborhood.jpeg",
-        help="Path to the image file to assess",
-    )
-    parser.add_argument(
-        "--criteria", type=str, default=None,
-        help='JSON array of criterion objects, e.g. \'[{"name":"sharpness","type":"quality"}]\'',
-    )
-    parser.add_argument(
-        "--criteria-file", type=Path, default=None,
-        help="Path to a JSON file containing the criteria array (alternative to --criteria)",
-    )
-    parser.add_argument(
-        "--base-url", default="http://192.168.5.233:4001",
-        help="Base URL of the LiteLLM proxy (or classifier directly)",
-    )
-    parser.add_argument(
-        "--api-key", default=None,
-        help="API key (defaults to DEFAULT_LITELLM_MASTER_KEY from .env)",
-    )
-    parser.add_argument(
-        "--max-wait", type=int, default=300,
-        help="Maximum seconds to wait for the job to complete",
-    )
-    parser.add_argument(
-        "--poll-interval", type=int, default=3,
-        help="Seconds between status polls",
-    )
+    parser.add_argument("--image", type=Path, default=SCRIPT_DIR / "Neighborhood.jpeg")
+    parser.add_argument("--criteria", type=str, default=None)
+    parser.add_argument("--criteria-file", type=Path, default=None)
+    parser.add_argument("--base-url", default="http://192.168.5.233:4001")
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--max-wait", type=int, default=300)
+    parser.add_argument("--poll-interval", type=int, default=3)
     args = parser.parse_args()
 
-    api_key  = args.api_key or load_api_key()
+    api_key = args.api_key or load_api_key()
+
     if args.criteria_file:
         criteria = json.loads(args.criteria_file.read_text(encoding="utf-8"))
     elif args.criteria:
         criteria = json.loads(args.criteria)
     else:
         criteria = DEFAULT_CRITERIA
-    image    = args.image.resolve()
 
+    image = args.image.resolve()
     if not image.exists():
         sys.exit(f"Image not found: {image}")
 
+    # --- Fetch and display capabilities ---
+    print(f"\nBase URL : {args.base_url}")
+
+    print("\nFetching hints...")
+    hints_data = fetch_hints(args.base_url, api_key)
+    print_hints(hints_data)
+
+    print("\nFetching CV detectors...")
+    detectors_data = fetch_cv_detectors(args.base_url, api_key)
+    print_cv_detectors(detectors_data)
+
+    # --- Submit and poll assessment job ---
     size_kb = image.stat().st_size / 1024
-    print(f"\nImage   : {image.name} ({size_kb:.1f} KB)")
-    print(f"Criteria: {[c['name'] for c in criteria]}")
-    print(f"Base URL: {args.base_url}\n")
+    print(f"\n{'=' * 60}")
+    print(f"  Assessment")
+    print(f"{'=' * 60}")
+    print(f"\nImage    : {image.name} ({size_kb:.1f} KB)")
+    print(f"Criteria : {[c['name'] for c in criteria]}\n")
 
     print("Submitting job...")
     job_id = submit_job(args.base_url, api_key, image, criteria)
-    print(f"Job ID  : {job_id}\n")
+    print(f"Job ID   : {job_id}\n")
 
     print("Polling for result...")
     job = poll_job(args.base_url, api_key, job_id, args.max_wait, args.poll_interval)

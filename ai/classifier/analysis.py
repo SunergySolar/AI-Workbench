@@ -342,12 +342,15 @@ async def analyze_bgr(
     # validate_and_clamp receives ALL criteria for correct weight lookup
     assessment = validate_and_clamp(raw_assessment, criteria)
 
-    # Step 6 — derive a CV-level verdict from whichever criteria ran through detectors
-    cv_failures = sum(1 for r in cv_results.values() if r.get("verdict") == "FAIL")
+    # Step 6 — derive CV-level overall verdict and score from whichever criteria
+    # ran through detectors, then fold them into the cv_checks dict itself.
     if cv_results:
+        cv_scores = [r["score"] for r in cv_results.values() if isinstance(r.get("score"), (int, float))]
+        cv_failures = sum(1 for r in cv_results.values() if r.get("verdict") == "FAIL")
         cv_verdict = "FAIL" if cv_failures >= 2 else ("MARGINAL" if cv_failures == 1 else "PASS")
-    else:
-        cv_verdict = "PASS"  # no CV criteria ran — no CV failures by definition
+        cv_overall_score = round(sum(cv_scores) / len(cv_scores)) if cv_scores else 5
+        cv_results["overall_verdict"] = cv_verdict
+        cv_results["overall_score"] = cv_overall_score
 
     # Step 7 — assemble the final response dict
     result = {
@@ -355,13 +358,16 @@ async def analyze_bgr(
             "width": original_w, "height": original_h,
             "format": content_type, "size_bytes": size_bytes,
         },
-        "cv_checks": cv_results,              # results of any CV-path criteria
-        "cv_overall_verdict": cv_verdict,     # verdict derived from CV checks only
-        "llm_assessment": assessment,         # all per-criterion scores + weighted breakdown
-        "combined_verdict": assessment.get("overall_verdict", cv_verdict),
+        "assessment": {
+            "cv":  cv_results,   # CV-path results + overall_verdict + overall_score
+            "llm": assessment,   # per-criterion scores, weighted breakdown, overall verdict
+        },
+        "combined_verdict": assessment.get("overall_verdict", cv_results.get("overall_verdict", "PASS")),
     }
-    logger.info("analyze_bgr: returning combined_verdict=%s cv=%s llm=%s",
-                result["combined_verdict"], cv_verdict, assessment.get("overall_verdict"))
+    logger.info("analyze_bgr: returning combined_verdict=%s cv_verdict=%s llm=%s",
+                result["combined_verdict"],
+                cv_results.get("overall_verdict", "n/a"),
+                assessment.get("overall_verdict"))
     return result
 
 
