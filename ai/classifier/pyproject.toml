@@ -1,0 +1,17 @@
+[project]
+name = "classifier"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "opencv-python-headless",
+    "numpy",
+    "pydantic",
+    "python-multipart",
+    "Pillow",
+    "aiosqlite",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+]

@@ -16,7 +16,7 @@ services:
     container_name: litellm
     restart: unless-stopped
     ports:
-      - "4001:4000"
+      - "${PORT_LITELLM}:4000"
     environment:
       STORE_MODEL_IN_DB: "True"
     env_file:
@@ -46,7 +46,7 @@ services:
       POSTGRES_USER: llmproxy
       POSTGRES_PASSWORD: dbpassword9090
     ports:
-      - "5432:5432"
+      - "${PORT_POSTGRES}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -60,7 +60,7 @@ services:
     restart: always
     container_name: prometheus
     ports:
-      - "9090:9090"
+      - "${PORT_PROMETHEUS}:9090"
     volumes:
       - prometheus_data:/prometheus
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
