@@ -145,13 +145,14 @@ For LAN-wide or off-LAN access, Open WebUI is fronted by a Cloudflare Tunnel rat
    - **Subdomain:** `chat`
    - **Domain:** `zeoenergy.com`
    - **Service type:** `HTTP`
-   - **URL:** `localhost:8007`
+   - **URL:** `openwebui:8080`
+   > **Important:** use the Docker service name + internal port, not `localhost:8007`. The `cloudflared` container is on the `ai_shared` network and reaches Open WebUI via Docker DNS; `localhost` would resolve to the cloudflared container itself.
 5. Cloudflare will auto-create the CNAME DNS record for `chat.zeoenergy.com` pointing at the tunnel.
 6. Start the tunnel container:
    ```bash
-   make tunnel
+   make up-cloudflared
    ```
-   Stop with `make tunnel-down`.
+   Stop with `make down-cloudflared`. Logs: `make logs-cloudflared`.
 7. Update `OPENWEBUI_WEBUI_URL=https://chat.zeoenergy.com` and `CORS_ALLOW_ORIGIN=https://chat.zeoenergy.com` in `.env` (already set), then restart Open WebUI:
    ```bash
    make down-openwebui && make up-openwebui
@@ -161,11 +162,11 @@ For LAN-wide or off-LAN access, Open WebUI is fronted by a Cloudflare Tunnel rat
 **Verifying:**
 
 ```bash
-docker logs cloudflared --tail 50   # should show "Registered tunnel connection"
-curl -I https://chat.zeoenergy.com   # should return 200 from Open WebUI
+docker logs ai-cloudflared --tail 50   # should show "Registered tunnel connection"
+curl -I https://chat.zeoenergy.com     # should return 200 from Open WebUI
 ```
 
-If the tunnel is up but the site 502s, the origin URL (`localhost:8007`) is unreachable from the `cloudflared` container — check `make up-openwebui` first.
+If the tunnel is up but the site 502s, the origin URL (`openwebui:8080`) is unreachable from the `cloudflared` container — confirm Open WebUI is running (`make up-openwebui`) and on the same `ai_shared` network.
 
 ### Restricting visible models
 

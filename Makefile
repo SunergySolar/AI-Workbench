@@ -37,6 +37,7 @@ $(eval $(call service,vllm,vllm-qwen vllm-qwen-vl))
 $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,classifier,classifier))
 $(eval $(call service,openwebui,openwebui))
+$(eval $(call service,cloudflared,cloudflared))
 
 setup: network
 	cd widget && uv sync && cd ..
@@ -68,12 +69,6 @@ build:
 logs:
 	@echo "Use logs-<service> to follow specific service logs."
 	@echo "Services: $(SERVICES)"
-	
-tunnel:
-	docker run -d --name cloudflared cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $(CLOUDFLARE_TUNNEL_TOKEN)
-
-tunnel-down:
-	docker stop cloudflared && docker rm cloudflared
 
 help:
 	@echo ""
@@ -90,4 +85,4 @@ help:
 	@$(foreach s,$(SERVICES),echo "  $(s): up-$(s)  down-$(s)  clean-$(s)  very-clean-$(s)  logs-$(s)  build-$(s)";)
 	@echo ""
 
-.PHONY: setup up down clean very-clean build logs help network tunnel tunnel-down
+.PHONY: setup up down clean very-clean build logs help network
