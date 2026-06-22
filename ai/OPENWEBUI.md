@@ -16,6 +16,8 @@ make up-openwebui
 
 Then open `http://localhost:8007`. The first account created becomes the admin. Sign-up is disabled afterwards (see `ENABLE_SIGNUP` below to change this).
 
+> Prefer a native window over a browser tab? A standalone desktop client is available at <https://github.com/open-webui/desktop> — point it at `http://localhost:8007` after the container is up.
+
 | Container | Port | Purpose |
 |---|---|---|
 | `openwebui` | `localhost:8007` | Chat UI — talks to LiteLLM over the `ai_shared` Docker network |
