@@ -13,21 +13,15 @@ services:
     ports:
       - "${PORT_OPENWEBUI}:8080"
     environment:
-      # Point Open WebUI at the LiteLLM proxy on the shared network.
-      # LiteLLM is reachable as `litellm:4000` inside ai_shared.
-      OPENAI_API_BASE_URL: "http://litellm:4000/v1"
+      # All values are sourced from .env — edit there, not here.
+      OPENAI_API_BASE_URL: "${OPENWEBUI_OPENAI_API_BASE_URL}"
       OPENAI_API_KEY: "${DEFAULT_LITELLM_MASTER_KEY}"
-
-      # Disable Ollama discovery — we route everything through LiteLLM.
-      ENABLE_OLLAMA_API: "false"
-
-      # Required for session persistence across container recreations.
+      ENABLE_OLLAMA_API: "${OPENWEBUI_ENABLE_OLLAMA_API}"
       WEBUI_SECRET_KEY: "${OPENWEBUI_SECRET_KEY}"
-
-      # Lock down the deployment: first sign-up becomes admin, subsequent
-      # sign-ups are disabled. Toggle to "true" if more accounts are needed.
-      ENABLE_SIGNUP: "false"
-      DEFAULT_USER_ROLE: "admin"
+      ENABLE_SIGNUP: "${OPENWEBUI_ENABLE_SIGNUP}"
+      DEFAULT_USER_ROLE: "${OPENWEBUI_DEFAULT_USER_ROLE}"
+      CORS_ALLOW_ORIGIN: "${CORS_ALLOW_ORIGIN}"
+      HF_TOKEN: "${HF_TOKEN}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

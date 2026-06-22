@@ -28,14 +28,18 @@ Both containers are attached to the `ai_shared` network, so Open WebUI reaches t
 
 The connection settings are passed in once at first launch:
 
-| Env var | Value | Source |
-|---|---|---|
-| `OPENAI_API_BASE_URL` | `http://litellm:4000/v1` | hardcoded in `docker-compose.openwebui.yml` |
-| `OPENAI_API_KEY` | LiteLLM master key | `${DEFAULT_LITELLM_MASTER_KEY}` from `.env` |
-| `ENABLE_OLLAMA_API` | `false` | disables the Ollama discovery probe |
-| `WEBUI_SECRET_KEY` | random hex string | `${OPENWEBUI_SECRET_KEY}` from `.env` |
-| `ENABLE_SIGNUP` | `false` | only the first sign-up is allowed |
-| `DEFAULT_USER_ROLE` | `admin` | first user gets the admin role |
+Every value is sourced from `.env` so configuration lives in one file.
+
+| Open WebUI env var | `.env` key | Default | Notes |
+|---|---|---|---|
+| `OPENAI_API_BASE_URL` | `OPENWEBUI_OPENAI_API_BASE_URL` | `http://litellm:4000/v1` | Must be the Docker service DNS name in compose, not localhost |
+| `OPENAI_API_KEY` | `DEFAULT_LITELLM_MASTER_KEY` | _(shared with LiteLLM)_ | Reuses the LiteLLM master key — no separate value needed |
+| `ENABLE_OLLAMA_API` | `OPENWEBUI_ENABLE_OLLAMA_API` | `false` | Disables the Ollama discovery probe |
+| `WEBUI_SECRET_KEY` | `OPENWEBUI_SECRET_KEY` | _(placeholder — rotate)_ | Signs sessions; stable value required to avoid log-outs on restart |
+| `ENABLE_SIGNUP` | `OPENWEBUI_ENABLE_SIGNUP` | `false` | Only the first sign-up is allowed when false |
+| `DEFAULT_USER_ROLE` | `OPENWEBUI_DEFAULT_USER_ROLE` | `admin` | Role given to the first (and any subsequent) sign-up |
+| `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
+| `HF_TOKEN` | `HF_TOKEN` | _(shared with vLLM)_ | Used for gated embedding / RAG model downloads. Same token also drives vLLM gated model downloads |
 
 > **Important:** Open WebUI only reads these env vars on the **first launch**. Once the SQLite store under `/app/backend/data` is initialized, further changes must be made through **Admin Settings → Connections** in the UI, or by deleting the `openwebui_data` volume and starting fresh.
 
