@@ -32,6 +32,9 @@ services:
       GOOGLE_CLIENT_ID: "${OPENWEBUI_GOOGLE_CLIENT_ID}"
       GOOGLE_CLIENT_SECRET: "${OPENWEBUI_GOOGLE_CLIENT_SECRET}"
       OPENID_PROVIDER_URL: "${OPENWEBUI_OPENID_PROVIDER_URL}"
+
+      # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
+      USER_AGENT: "${OPENWEBUI_USER_AGENT}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

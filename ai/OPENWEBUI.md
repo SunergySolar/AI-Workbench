@@ -44,6 +44,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(empty)_ | Google Cloud OAuth 2.0 client ID — see [Google OAuth setup](#google-oauth-setup) |
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
+| `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
 | `HF_TOKEN` | `HF_TOKEN` | _(shared with vLLM)_ | Used for gated embedding / RAG model downloads. Same token also drives vLLM gated model downloads |
 
