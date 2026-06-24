@@ -35,6 +35,10 @@ services:
 
       # User-Agent for langchain_community outbound HTTP (RAG / web loaders).
       USER_AGENT: "${OPENWEBUI_USER_AGENT}"
+
+      # MCP handshake timeout (seconds). Raise if a registered MCP server
+      # cold-starts slowly.
+      MCP_INITIALIZE_TIMEOUT: "${OPENWEBUI_MCP_INITIALIZE_TIMEOUT}"
     volumes:
       - openwebui_data:/app/backend/data
     healthcheck:

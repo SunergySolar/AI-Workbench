@@ -45,6 +45,7 @@ Every value is sourced from `.env` so configuration lives in one file.
 | `GOOGLE_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(empty)_ | Matching client secret |
 | `OPENID_PROVIDER_URL` | `OPENWEBUI_OPENID_PROVIDER_URL` | Google discovery doc | OIDC discovery document URL; required for clean provider-side logout |
 | `USER_AGENT` | `OPENWEBUI_USER_AGENT` | `OpenWebUI/1.0 (+github.com/open-webui/open-webui)` | User-Agent applied to outbound HTTP from RAG / web loaders (langchain_community); silences the "USER_AGENT not set" warning |
+| `MCP_INITIALIZE_TIMEOUT` | `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` | `30` | Seconds to wait for an MCP server's initialize handshake; raise for slow cold-starts (upstream default: 10) |
 | `CORS_ALLOW_ORIGIN` | `CORS_ALLOW_ORIGIN` | `*` | Tighten to a specific origin if another web app calls Open WebUI's API from the browser |
 | `HF_TOKEN` | `HF_TOKEN` | _(shared with vLLM)_ | Used for gated embedding / RAG model downloads. Same token also drives vLLM gated model downloads |
 
@@ -167,6 +168,30 @@ curl -I https://chat.zeoenergy.com     # should return 200 from Open WebUI
 ```
 
 If the tunnel is up but the site 502s, the origin URL (`openwebui:8080`) is unreachable from the `cloudflared` container — confirm Open WebUI is running (`make up-openwebui`) and on the same `ai_shared` network.
+
+### MCP tools (Phoenix)
+
+Open WebUI v0.6.31+ supports MCP servers over **Streamable HTTP** natively — no `mcpo` proxy or bridge needed. Phoenix already speaks that transport, so connecting it is purely an admin-UI action.
+
+**Register Phoenix as an external tool:**
+
+1. Log in as admin → **Admin Panel → Settings → External Tools** (or `Tools` in some versions).
+2. Click **+ Add Server**.
+3. Fill in:
+   - **Type:** `MCP (Streamable HTTP)`
+   - **Server URL:** `https://phoenix-mcp.com/mcp` (the value of `DEFAULT_LITELLM_MCP_PHOENIX_URL` in `.env`)
+   - **Auth type:** `Bearer`
+   - **Key:** the value of `DEFAULT_LITELLM_MCP_PHOENIX_AUTH_VALUE` in `.env`
+   - **Name:** `phoenix` (or anything memorable)
+4. Save. Open WebUI calls `initialize` against the server, lists its tools, and they become available to chats.
+
+**Using it in a chat:**
+
+In a chat, click the **Tools** icon (paperclip-like) → toggle **phoenix** on. The model can now invoke Phoenix's database tools mid-response.
+
+> **Heads-up:** Open WebUI's MCP support is parallel to the `mcp_servers` block in `litellm_config.yaml`. The LiteLLM block lets *models routed through LiteLLM* (e.g. Claude Code via the proxy) call Phoenix tools server-side. The Open WebUI registration lets the *Open WebUI chat itself* call Phoenix tools client-side. Both can coexist using the same URL + token; they're not exclusive.
+
+**If the handshake times out** (you see "MCP server failed to initialize" in the logs), bump `OPENWEBUI_MCP_INITIALIZE_TIMEOUT` in `.env` (currently `30s`, upstream default is `10s`) and restart Open WebUI.
 
 ### Restricting visible models
 
