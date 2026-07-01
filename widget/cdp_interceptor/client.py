@@ -131,10 +131,14 @@ class InterceptorClient:
         """Start Chrome (headless if the sentinel exists) and begin the CDP
         loop. Non-blocking — spawns a worker thread. A second call while
         running is a no-op (logs a warning)."""
+        # Guard against accidental double-launch from the same client. Callers
+        # who want a fresh session should quit() first.
         if self.is_running:
             logger.warning("InterceptorClient.launch: already running — ignoring")
             return
 
+        # Locate the Chrome executable. `chrome_path` overrides `find_chrome()`
+        # if the caller supplied one; otherwise search default install paths.
         chrome = self._chrome_path or find_chrome()
         if chrome is None:
             with self._lock:
@@ -143,17 +147,31 @@ class InterceptorClient:
             self._notify_status()
             raise ChromeNotFoundError("No Chrome executable found")
 
+        # Ensure the profile dir exists and clear any stale singleton locks
+        # left over from a prior Chrome crash (see launcher.clear_singleton_locks).
         os.makedirs(self._profile_dir, exist_ok=True)
         clear_singleton_locks(self._profile_dir)
 
+        # Remember the resolved Chrome path and target URL so relaunch/reload
+        # paths can reuse them without the caller re-supplying.
         self._chrome_path = chrome
         self._target_url = target_url
+
+        # Reset the shutdown/reload signals from any prior run of this client.
         self._stop_event.clear()
         self._reload_event.clear()
 
+        # Decide whether to launch headless. Only headless if:
+        #   1. session_sentinel is enabled (caller opted in), AND
+        #   2. a sentinel file exists in the profile dir (we've had at least
+        #      one successful login on this profile before).
+        # First-ever launch always goes visible so the user can log in.
         headless = self._session_sentinel and session_exists(self._profile_dir)
         with self._lock:
             self._headless = headless
+
+        # Fork Chrome. Popen returns immediately; Chrome takes ~1-3s to
+        # start the debug server, which the worker thread handles by polling.
         self._proc = start_chrome(
             chrome,
             headless=headless,
@@ -163,11 +181,14 @@ class InterceptorClient:
         )
         logger.debug("InterceptorClient.launch: Chrome started (pid=%s)", self._proc.pid)
 
+        # Report "loading" so caller UI can show a spinner or similar.
         with self._lock:
             self._status = "loading"
             self._error = None
         self._notify_status()
 
+        # Spawn the worker thread. daemon=True so it dies with the process
+        # if the caller forgets to quit() explicitly.
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
@@ -210,19 +231,38 @@ class InterceptorClient:
 
     @property
     def _interceptor_script(self) -> str:
+        """Return the JS to inject, with DEBUG_LOGGING prepended as a constant.
+
+        Callers can override the bundled interceptor.js entirely via the
+        constructor's `interceptor_script` param; otherwise we use the file
+        that shipped with the package. Either way, we prepend a `const
+        DEBUG_LOGGING = <bool>;` line so the injected script can gate its
+        own console.log calls without needing runtime configuration.
+        """
         base = self._interceptor_script_override or _BUNDLED_INTERCEPTOR_JS
         flag = "true" if self._debug_logging else "false"
         return f"const DEBUG_LOGGING = {flag};\n" + base
 
     def _kill_chrome(self, label: str = "") -> None:
+        """Terminate the current Chrome process cleanly, force-kill on hang.
+
+        Two-stage shutdown:
+          1. terminate() sends SIGTERM (Windows: CTRL_BREAK). Chrome usually
+             takes ~1s to close all its child processes.
+          2. If it hasn't exited within 3s, escalate to kill() (SIGKILL).
+        Nullifies self._proc first so concurrent callers can't double-kill.
+        """
         if self._proc is None:
             return
+        # Move self._proc into a local var before killing — this closes the
+        # window where a concurrent quit() could try to kill the same proc.
         proc, self._proc = self._proc, None
         try:
             proc.terminate()
             try:
                 proc.wait(timeout=3)
             except Exception:
+                # Graceful shutdown didn't complete in 3s; force-kill.
                 proc.kill()
                 proc.wait(timeout=2)
         except Exception as exc:
@@ -230,19 +270,36 @@ class InterceptorClient:
             logger.warning("InterceptorClient._kill_chrome%s: %s", suffix, exc)
 
     def _relaunch(self, *, headless: bool) -> None:
+        """Stop the current session and start a fresh one in the requested mode.
+
+        Called by go_headless() / go_visible(). We can't just re-navigate the
+        existing tab because the launch flags (`--headless=new`, window size,
+        user-agent) are set at process start — the only way to change them is
+        to kill and restart Chrome.
+        """
         if not self._chrome_path or not self._target_url:
+            # Nothing to relaunch — launch() was never called successfully.
             logger.warning("relaunch: launch() has not been called yet")
             return
-        # Ask the current worker to stop, kill Chrome, restart both.
+
+        # Signal the worker to stop, then wait briefly for it to exit its
+        # inner loops. Chrome dies first so any in-flight CDP calls fail fast.
         self._stop_event.set()
         self._kill_chrome(f"relaunch(headless={headless})")
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(timeout=2)
+
+        # Reset both signals for the fresh worker.
         self._stop_event.clear()
         self._reload_event.clear()
+
+        # Update our state to reflect the new mode BEFORE spawning so any
+        # get_state() call in between sees consistent data.
         with self._lock:
             self._headless = headless
             self._status = "loading"
+
+        # Launch Chrome again with the new headless flag.
         self._proc = start_chrome(
             self._chrome_path,
             headless=headless,
@@ -253,13 +310,26 @@ class InterceptorClient:
         logger.debug("InterceptorClient._relaunch: Chrome pid=%s headless=%s",
                      self._proc.pid, headless)
         self._notify_status()
+
+        # Spawn a fresh worker. The old worker's thread object is discarded.
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
     # ── Callbacks handed to run_session ───────────────────────────────────────
+    # These wrap the user's callbacks so we can update our own state (status,
+    # sentinel, last_capture_at) before/after forwarding.
 
     def _on_data_inner(self, parsed: dict) -> None:
-        """Wraps user's on_data so we can update state + mark sentinel."""
+        """Called by run_session each time a parseable body arrives.
+
+        Order of operations matters:
+          1. Update internal state to "ok" so subsequent get_state() reflects
+             a successful capture.
+          2. Write the sentinel file — this is what enables future headless
+             launches. Only do it if the caller opted into sentinel mode.
+          3. Notify status listeners so callers see "ok".
+          4. Fire the user's on_data callback with the parsed dict.
+        """
         with self._lock:
             self._status = "ok"
             self._error = None
@@ -271,9 +341,13 @@ class InterceptorClient:
             try:
                 self._user_on_data(parsed)
             except Exception as exc:
+                # User callback exceptions must not crash the worker.
                 logger.warning("user on_data raised: %s", exc)
 
     def _on_capture_inner(self, cap: Capture) -> None:
+        """Forward every raw capture to the user's on_capture, if any.
+        We don't touch state here — on_capture is a pure inspection hook,
+        not a "success" signal (a capture may arrive that doesn't parse)."""
         if self._user_on_capture:
             try:
                 self._user_on_capture(cap)
@@ -281,6 +355,8 @@ class InterceptorClient:
                 logger.warning("user on_capture raised: %s", exc)
 
     def _on_status_inner(self, status: str, error: Optional[str]) -> None:
+        """run_session reports status changes ("waiting_login", etc.) here.
+        Merge them into our state and notify the user's on_status callback."""
         with self._lock:
             self._status = status
             if error is not None:
@@ -288,6 +364,9 @@ class InterceptorClient:
         self._notify_status()
 
     def _notify_status(self) -> None:
+        """Invoke the user's on_status callback with a lock-guarded snapshot.
+        Snapshot-then-release means the callback doesn't hold the lock while
+        it runs, so it can safely call back into get_state() if it wants."""
         if self._user_on_status is None:
             return
         with self._lock:
@@ -301,13 +380,29 @@ class InterceptorClient:
 
     def _loop(self) -> None:
         """Reconnect-forever loop. Handles TimeoutError → sentinel-driven
-        visible relaunch. Exits when stop_event is set."""
-        time.sleep(4)  # give Chrome time to open its tab
+        visible relaunch. Exits when stop_event is set.
+
+        Each iteration is one CDP session. When run_session returns (WebSocket
+        died, page closed, capture timed out, etc.) we clean up and reconnect
+        after a short delay. This makes the client resilient to transient
+        network hiccups and Chrome restarts.
+        """
+        # Give Chrome time to open its tab and start the debug endpoint before
+        # we try to connect. Without this we hit a race where run_session's
+        # /json poll starts before Chrome is ready, wastes retries, and fails.
+        time.sleep(4)
+
         while not self._stop_event.is_set():
+            # Report "loading" at the top of each attempt. Status may have
+            # been "ok" from a previous session that just died — reset so
+            # callers see we're re-establishing.
             with self._lock:
                 self._status = "loading"
             self._notify_status()
+
             try:
+                # Run one CDP session — blocks until the WebSocket dies,
+                # stop_event fires, or an exception is raised.
                 run_session(
                     debug_port=self._debug_port,
                     interceptor_script=self._interceptor_script,
@@ -325,23 +420,39 @@ class InterceptorClient:
                     login_url_keywords=self._login_url_keywords,
                 )
             except TimeoutError as exc:
-                # Login timed out. If we were running headless the session
-                # expired — clear sentinel and relaunch visibly so user can
-                # log in again.
+                # TimeoutError specifically means the user didn't complete
+                # login in `login_timeout` seconds. Two possible scenarios:
+                #
+                # A) We were running HEADLESS and the sentinel says we've
+                #    logged in before — this means the persisted session
+                #    expired. Clear the sentinel, kill the headless Chrome,
+                #    and relaunch VISIBLY so the user can log in again.
+                #    Status → "waiting_login" so the caller's UI shows a
+                #    login prompt. The next loop iteration will start a
+                #    fresh session against the visible Chrome.
+                #
+                # B) Anything else (visible mode, or no prior sentinel) —
+                #    plain error, report it and let the loop reconnect.
                 if (
                     self._session_sentinel
                     and session_exists(self._profile_dir)
                     and self._chrome_path
                 ):
+                    # Case A: headless session expired.
                     logger.warning(
                         "InterceptorClient._loop: headless session expired, relaunching visibly"
                     )
+                    # Clear sentinel so we DON'T immediately go headless
+                    # again — the user has to log in first and produce a
+                    # fresh on_data, which will re-write the sentinel.
                     clear_session(self._profile_dir)
                     self._kill_chrome("session-expired")
                     with self._lock:
                         self._headless = False
                         self._error = "Session expired — please log in again"
                         self._status = "waiting_login"
+                    # Launch a fresh visible Chrome. The next loop iteration
+                    # will connect to it and wait for the user to complete login.
                     self._proc = start_chrome(
                         self._chrome_path,
                         headless=False,
@@ -351,18 +462,27 @@ class InterceptorClient:
                     )
                     self._notify_status()
                 else:
+                    # Case B: not a sentinel-recoverable scenario.
                     with self._lock:
                         self._error = str(exc)
                         self._status = "error"
                     self._notify_status()
             except Exception as exc:
+                # Any other exception — record it and let the loop retry.
+                # We don't crash the worker because the caller may not have
+                # a way to notice and restart us.
                 logger.error("InterceptorClient._loop: %s", exc)
                 with self._lock:
                     self._error = str(exc)
                     self._status = "error"
                 self._notify_status()
 
+            # Check for shutdown before waiting — quit() may have been called
+            # while we were mid-session; no point sleeping if we're stopping.
             if self._stop_event.is_set():
                 break
+
+            # Back off before reconnecting. Using stop_event.wait() instead
+            # of time.sleep() so quit() can wake us early.
             logger.debug("InterceptorClient._loop: session ended, reconnecting in 15s")
             self._stop_event.wait(15)
