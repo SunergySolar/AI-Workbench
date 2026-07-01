@@ -190,17 +190,11 @@ The status line shows when data was last fetched, or a descriptive error if some
 
 ### How it works
 
-Chrome is launched with `--remote-debugging-port` enabled, which exposes Chrome's built-in **DevTools Protocol (CDP)** on `localhost`. The widget connects to the open tab over a WebSocket and injects a small JavaScript interceptor before the page makes its API calls.
+The widget delegates all Chrome / CDP / interceptor logic to the `cdp_interceptor` library (a standalone reusable package in this same repo). In short: Chrome launches with a remote-debugging port on an isolated profile, a JavaScript interceptor is injected that copies every JSON response into `window._capturedResponses`, and the widget's `response_parser.parse_response` picks the first response whose shape it recognises (utilization first, then raw token buckets).
 
-The interceptor patches `window.fetch` and `XMLHttpRequest` so that every JSON response the page receives is also copied into a list (`window._capturedResponses`). Crucially:
+Because `navigator.webdriver` is not set and no ChromeDriver process is involved, the browser looks like a normal user session — Cloudflare and similar bot-detection layers do not trigger.
 
-- The **real requests go out normally** — the page renders and behaves exactly as if you'd opened it yourself
-- The response body is **cloned before reading**, so the page still gets its data unmodified
-- The interceptor is **guarded against double-injection** — re-running it on an already-patched page is a no-op
-
-Once the page has loaded, the widget reads `window._capturedResponses` via CDP, sorts the entries so URL-hinted responses (containing words like `usage`, `token`, `billing`) float to the top, and parses whichever response matches a known shape — utilization blocks (`five_hour`, `seven_day`) are tried first, falling back to raw token-bucket fields.
-
-Because `navigator.webdriver` is not set and no ChromeDriver process is involved, the browser looks identical to a normal user session — Cloudflare and similar bot-detection layers do not trigger.
+For full details — the public API, every configurable argument, threading model, url_patterns vs parse_fn, session-sentinel behavior, and how to reuse the library on any other site — see [`USAGE_INTERCEPTOR.md`](USAGE_INTERCEPTOR.md).
 
 ### Refresh interval
 
@@ -334,17 +328,15 @@ If both accounts have been used in the same working directory, their sessions wi
 | File | Purpose |
 |---|---|
 | `claude_usage_widget.py` | Entry point |
-| `config.py` | `.env` loader and all configuration constants |
-| `logging_setup.py` | Shared logger used by all modules |
-| `usage_parser.py` | JSONL scanner — `get_usage_summary()` |
-| `usage_fetcher.py` | `BrowserLinker` — orchestrates the browser link and account stats polling |
-| `chrome_launcher.py` | Finds, launches, and manages the Chrome process; handles the session sentinel |
-| `cdp_client.py` | CDP session management — persistent WebSocket connection to Chrome's debug endpoint |
-| `cdp_spy.py` | Injects the fetch/XHR interceptor into the active tab and reads captured responses |
-| `response_parser.py` | Parses raw API response bodies captured from claude.ai into the display dict |
-| `usage_popup.py` | `UsagePopup` — the tkinter popup window |
-| `tray_icon.py` | `make_tray_icon()` — generates the tray icon image |
-| `startup.py` | Windows registry helpers for run-at-login |
-| `widget.py` | `ClaudeUsageWidget` — orchestrates all of the above |
-| `.env` | Local configuration (not committed) |
+| `claude_observer/config.py` | `config.json` loader and all configuration constants |
+| `claude_observer/logging_setup.py` | Shared logger used by all widget modules |
+| `claude_observer/core/usage_parser.py` | JSONL scanner — `get_usage_summary()` |
+| `claude_observer/core/widget.py` | `ClaudeUsageWidget` — orchestrates all of the above |
+| `claude_observer/browser/fetcher.py` | `BrowserLinker` — thin wrapper around `cdp_interceptor` that plugs claude.ai's response parser in |
+| `claude_observer/browser/response_parser.py` | Parses raw API response bodies captured from claude.ai into the display dict |
+| `claude_observer/ui/popup.py` | `UsagePopup` — the tkinter popup window |
+| `claude_observer/ui/tray_icon.py` | `make_tray_icon()` — generates the tray icon image |
+| `claude_observer/system/startup.py` | Windows registry helpers for run-at-login |
+| `cdp_interceptor/` | Standalone, site-agnostic Chrome DevTools Protocol interceptor library — see [`USAGE_INTERCEPTOR.md`](USAGE_INTERCEPTOR.md) |
+| `config.json` | Local configuration |
 | `~/.claude_widget/chrome_profile/` | Persistent Chrome session data (created on first Link Browser click) |
