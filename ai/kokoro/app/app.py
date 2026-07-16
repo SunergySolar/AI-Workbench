@@ -80,11 +80,22 @@ def list_voices():
 
 @app.get("/languages")
 def list_languages():
-    return {"languages": [{"code": code, "name": name} for code, name in LANGUAGES.items()]}
+    """Return every language Kokoro supports, with its voices."""
+    grouped: dict[str, list[str]] = {code: [] for code in LANGUAGES}
+    for v in _get_voices():
+        prefix = v[0]
+        if prefix in grouped:
+            grouped[prefix].append(v)
+    return {
+        "languages": [
+            {"code": code, "name": name, "voices": sorted(grouped[code])}
+            for code, name in LANGUAGES.items()
+        ]
+    }
 
 
 @app.post("/generate")
-def generate(text: str, voice: str = "af_heart", language: str | None = None):
+def generate(text: str, voice: str = "af_heart"):
     voices = _get_voices()
     if voice not in voices:
         raise HTTPException(
@@ -92,16 +103,7 @@ def generate(text: str, voice: str = "af_heart", language: str | None = None):
             detail=f"Unknown voice '{voice}'. Available: {voices}",
         )
 
-    if language is None:
-        language = voice[0]
-    elif language != voice[0]:
-        logger.warning(
-            "Language/voice mismatch: language=%s but voice=%s (prefix %s). "
-            "Proceeding as requested; pronunciation may be off.",
-            language, voice, voice[0],
-        )
-
-    pipeline = _get_pipeline(language)
+    pipeline = _get_pipeline(voice[0])
     gen = pipeline(text, voice=voice)
 
     try:

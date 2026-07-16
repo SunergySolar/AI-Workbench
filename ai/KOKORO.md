@@ -127,7 +127,7 @@ Voices come from the Kokoro model on HuggingFace. Run `/voices` to see all avail
 
 ### Language support
 
-Kokoro supports nine languages. Each requires its own `KPipeline`; the app caches one per language and instantiates them lazily on first use.
+Kokoro supports nine languages. Each voice is trained for exactly one language — the first character of the voice name is the language code — so the language is derived from the voice you pick. There is no separate `language` parameter on any endpoint. Each language uses its own `KPipeline`; the app caches one per language and instantiates them lazily on first use.
 
 | Code | Language | Voice prefix |
 |---|---|---|
@@ -141,19 +141,31 @@ Kokoro supports nine languages. Each requires its own `KPipeline`; the app cache
 | `p` | Brazilian Portuguese | `pf_*`, `pm_*` |
 | `z` | Mandarin | `zf_*`, `zm_*` |
 
-**Discover:**
+**Discover — voices grouped by language:**
 
 ```bash
 curl http://localhost:8004/languages
 ```
 
-**Generate with an explicit language:**
+Returns something like:
 
-```bash
-curl -X POST "http://localhost:8004/generate?text=Bonjour&voice=ff_siwis&language=f" \
-  --output fr.wav
+```json
+{
+  "languages": [
+    {"code": "a", "name": "American English", "voices": ["af_heart", "am_adam", ...]},
+    {"code": "j", "name": "Japanese",         "voices": ["jf_alpha", "jm_kumo", ...]},
+    ...
+  ]
+}
 ```
 
-The `language` parameter is also accepted on `/v1/audio/speech` as an extension to the OpenAI schema and on the `text_to_speech` MCP tool. If `language` is omitted, it is inferred from the first character of the voice name — so existing callers do not need to change.
+**Generate:**
+
+```bash
+curl -X POST "http://localhost:8004/generate?text=Bonjour&voice=ff_siwis" --output fr.wav
+curl -X POST "http://localhost:8004/generate?text=%E3%83%8F%E3%83%AD%E3%83%BC&voice=jf_alpha" --output ja.wav
+```
+
+Note that OpenAI voice aliases (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) always map to English voices. To speak another language via `/v1/audio/speech`, pass a Kokoro voice name in the `voice` field.
 
 Japanese and Mandarin use extra G2P dependencies (`misaki[ja]`, `misaki[zh]`), which are installed as part of `kokoro-app`.
