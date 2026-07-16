@@ -38,6 +38,7 @@ $(eval $(call service,kokoro,kokoro-app kokoro-api))
 $(eval $(call service,madlad,madlad-app madlad-api))
 $(eval $(call service,classifier,classifier))
 $(eval $(call service,openwebui,openwebui))
+$(eval $(call service,oauth2-proxy,oauth2-proxy))
 $(eval $(call service,cloudflared,cloudflared))
 
 setup: network
