@@ -23,11 +23,27 @@ CACHE_DIR = "/root/.cache/huggingface"
 # Lazy-loaded — initialized on first request to avoid blocking startup.
 _translator = None
 _tokenizer = None
-_languages = None
+_languages: list[dict] | None = None
+_language_codes: set[str] | None = None
+
+
+def _describe_lang(code: str) -> str:
+    """Human-readable name for a MADLAD language code.
+
+    Handles ISO 639-1, 639-3, and regional variants (e.g. 'zh_CN'). Falls back
+    to the raw code for anything langcodes doesn't recognise.
+    """
+    import langcodes
+
+    try:
+        name = langcodes.Language.get(code.replace("_", "-")).display_name()
+        return name if name and name != code else code
+    except Exception:
+        return code
 
 
 def _load():
-    global _translator, _tokenizer, _languages  # noqa: PLW0603
+    global _translator, _tokenizer, _languages, _language_codes  # noqa: PLW0603
     if _translator is not None:
         return
 
@@ -44,13 +60,15 @@ def _load():
     _tokenizer = spm.SentencePieceProcessor(model_file=f"{model_dir}/spiece.model")
 
     lang_pattern = re.compile(r"^<2([a-z]{2,3}(?:_[A-Za-z]+)?)>$")
-    _languages = sorted(
+    codes = sorted(
         {
             m.group(1)
             for i in range(_tokenizer.get_piece_size())
             if (m := lang_pattern.match(_tokenizer.id_to_piece(i)))
         }
     )
+    _language_codes = set(codes)
+    _languages = [{"code": c, "name": _describe_lang(c)} for c in codes]
     logger.info("MADLAD ready. %d target languages available.", len(_languages))
 
 
@@ -78,7 +96,7 @@ class TranslateRequest(BaseModel):
 @app.post("/translate")
 def translate(req: TranslateRequest):
     _load()
-    if req.target_lang not in _languages:
+    if req.target_lang not in _language_codes:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown target_lang '{req.target_lang}'. Use /languages to list supported codes.",

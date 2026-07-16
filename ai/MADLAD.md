@@ -23,9 +23,15 @@ All client traffic goes through `madlad-api` on port 8008. `madlad-app` is not e
 
 ```bash
 curl http://localhost:8008/languages
+# {"languages": [
+#   {"code": "af", "name": "Afrikaans"},
+#   {"code": "am", "name": "Amharic"},
+#   {"code": "ar", "name": "Arabic"},
+#   ...
+# ]}
 ```
 
-Returns 400+ ISO 639-1 language codes.
+Returns 400+ objects, each with a `code` (used as `target_lang` in `/translate`) and a human-readable `name`. Codes are ISO 639-1 where available, otherwise ISO 639-3, occasionally with a regional suffix (e.g. `zh_CN`).
 
 **Translate text:**
 
@@ -102,7 +108,7 @@ ai/
   Dockerfile.madlad-api      ← builds the proxy container
   madlad/
     app/
-      pyproject.toml         ← app deps (ctranslate2, sentencepiece, huggingface_hub, fastapi, uvicorn)
+      pyproject.toml         ← app deps (ctranslate2, sentencepiece, huggingface_hub, langcodes, fastapi, uvicorn)
       app.py                 ← FastAPI inference server on :8085
     api/
       pyproject.toml         ← api deps (fastapi, uvicorn, httpx, fastmcp)
@@ -180,11 +186,13 @@ The response will include a `tool_calls` entry naming `translate` with arguments
 MADLAD-400 supports 400+ languages, drawn from the CommonCrawl-based MADLAD-400 corpus. To see the full list from your running container:
 
 ```bash
-curl http://localhost:8008/languages | jq '.languages | length'   # count
-curl http://localhost:8008/languages | jq '.languages'            # full list
+curl http://localhost:8008/languages | jq '.languages | length'                    # count
+curl http://localhost:8008/languages | jq '.languages'                             # full list
+curl http://localhost:8008/languages | jq '.languages[] | .code'                   # just codes
+curl http://localhost:8008/languages | jq '.languages[] | "\(.code)\t\(.name)"' -r # tab-separated
 ```
 
-Language codes follow ISO 639-1 where available (e.g. `en`, `es`, `fr`, `de`, `ja`, `zh`, `ko`, `ar`, `hi`, `pt`). Some low-resource languages use ISO 639-3 (three-letter) codes.
+Codes follow ISO 639-1 where available (e.g. `en`, `es`, `fr`, `de`, `ja`, `zh`, `ko`, `ar`, `hi`, `pt`). Some low-resource languages use ISO 639-3 (three-letter) codes. Display names are resolved via the [`langcodes`](https://github.com/rspeer/langcodes) library; unknown codes fall back to the code itself as the name.
 
 ### License note
 
