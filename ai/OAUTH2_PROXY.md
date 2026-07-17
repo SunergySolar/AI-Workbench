@@ -98,41 +98,45 @@ This grants the service account read-only access to group membership across the 
 
 ## Configuration reference
 
-Values are sourced from the root `.env`. Compose interpolates them at start.
+Every value is sourced from the root `.env` — edit there, never in the compose file. The `PORT_OAUTH2_PROXY` slot in the port registry reserves `4180` even though it is not published to the host (cloudflared reaches oauth2-proxy over the `ai_shared` Docker network by service name).
 
-| Env var | Source in `.env` | Purpose |
-|---|---|---|
-| `OAUTH2_PROXY_PROVIDER` | hardcoded `google` | Selects Google provider |
-| `OAUTH2_PROXY_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | Reused from Open WebUI's OAuth client |
-| `OAUTH2_PROXY_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | Same client's secret |
-| `OAUTH2_PROXY_COOKIE_SECRET` | `OAUTH2_PROXY_COOKIE_SECRET` | 32-byte URL-safe base64. Signs session cookies. Generate as shown in `.env.example` |
-| `OAUTH2_PROXY_EMAIL_DOMAINS` | hardcoded `zeoenergy.com` | Rejects any sign-in outside this domain before the group check |
-| `OAUTH2_PROXY_UPSTREAMS` | hardcoded `http://openwebui:8080` | Where to proxy authenticated requests. Docker service DNS, not localhost |
-| `OAUTH2_PROXY_HTTP_ADDRESS` | hardcoded `0.0.0.0:4180` | Listener inside the container |
-| `OAUTH2_PROXY_REVERSE_PROXY` | `true` | Trusts `X-Forwarded-*` headers from cloudflared |
-| `OAUTH2_PROXY_REDIRECT_URL` | `https://chat.zeoenergy.com/oauth2/callback` | Must match the URI added to the Google OAuth client |
-| `OAUTH2_PROXY_COOKIE_DOMAINS` | `chat.zeoenergy.com` | Cookie is only sent for this hostname |
-| `OAUTH2_PROXY_WHITELIST_DOMAINS` | `chat.zeoenergy.com` | Allowed post-login redirect targets |
-| `OAUTH2_PROXY_GOOGLE_GROUPS` | `zeoai.access@zeoenergy.com` | User must belong to this group |
-| `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` | `admin@gosunergy.com` | Workspace admin the service account impersonates to read group members |
-| `OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON` | `/etc/oauth2-proxy/sa-key.json` | Path inside the container (see volume mount) |
-| `OAUTH2_PROXY_COOKIE_EXPIRE` | `1h` | Hard session lifetime |
-| `OAUTH2_PROXY_COOKIE_REFRESH` | `15m` | Re-check group membership at this interval within a session |
-| `OAUTH2_PROXY_PASS_USER_HEADERS` | `true` | Sends `X-Forwarded-Email`, `X-Forwarded-User` to Open WebUI |
-| `OAUTH2_PROXY_SET_XAUTHREQUEST` | `true` | Also sets `X-Auth-Request-*` headers |
+| Compose env var | `.env` key | Default | Notes |
+|---|---|---|---|
+| `OAUTH2_PROXY_PROVIDER` | `OAUTH2_PROXY_PROVIDER` | `google` | OAuth provider — only google is exercised here |
+| `OAUTH2_PROXY_HTTP_ADDRESS` | `OAUTH2_PROXY_HTTP_ADDRESS` | `0.0.0.0:4180` | Listener inside the container. Port must equal `PORT_OAUTH2_PROXY` |
+| `OAUTH2_PROXY_REVERSE_PROXY` | `OAUTH2_PROXY_REVERSE_PROXY` | `true` | Trusts `X-Forwarded-*` headers from cloudflared |
+| `OAUTH2_PROXY_PASS_USER_HEADERS` | `OAUTH2_PROXY_PASS_USER_HEADERS` | `true` | Forwards `X-Forwarded-Email` / `X-Forwarded-User` to Open WebUI |
+| `OAUTH2_PROXY_SET_XAUTHREQUEST` | `OAUTH2_PROXY_SET_XAUTHREQUEST` | `true` | Also emits `X-Auth-Request-*` headers |
+| `OAUTH2_PROXY_CLIENT_ID` | `OPENWEBUI_GOOGLE_CLIENT_ID` | _(reused)_ | Reused from Open WebUI's Google OAuth 2.0 client |
+| `OAUTH2_PROXY_CLIENT_SECRET` | `OPENWEBUI_GOOGLE_CLIENT_SECRET` | _(reused)_ | Same client's secret |
+| `OAUTH2_PROXY_COOKIE_SECRET` | `OAUTH2_PROXY_COOKIE_SECRET` | _(generate)_ | 32-byte URL-safe base64. Signs session cookies. See generator snippet in `.env.example` |
+| `OAUTH2_PROXY_COOKIE_DOMAINS` | `OAUTH2_PROXY_COOKIE_DOMAINS` | `chat.zeoenergy.com` | Cookie is only sent to this hostname |
+| `OAUTH2_PROXY_COOKIE_EXPIRE` | `OAUTH2_PROXY_COOKIE_EXPIRE` | `1h` | Hard session lifetime |
+| `OAUTH2_PROXY_COOKIE_REFRESH` | `OAUTH2_PROXY_COOKIE_REFRESH` | `15m` | Re-check group membership at this interval within a session |
+| `OAUTH2_PROXY_UPSTREAMS` | `OAUTH2_PROXY_UPSTREAMS` | `http://openwebui:8080` | Where to proxy authenticated requests. Docker service DNS, not localhost |
+| `OAUTH2_PROXY_REDIRECT_URL` | `OAUTH2_PROXY_REDIRECT_URL` | `https://chat.zeoenergy.com/oauth2/callback` | Must match the URI added to the Google OAuth client |
+| `OAUTH2_PROXY_WHITELIST_DOMAINS` | `OAUTH2_PROXY_WHITELIST_DOMAINS` | `chat.zeoenergy.com` | Allowed post-login redirect targets |
+| `OAUTH2_PROXY_EMAIL_DOMAINS` | `OAUTH2_PROXY_EMAIL_DOMAINS` | `zeoenergy.com` | Rejects any sign-in outside this domain before the group check |
+| `OAUTH2_PROXY_GOOGLE_GROUPS` | `OAUTH2_PROXY_GOOGLE_GROUPS` | `zeoai.access@zeoenergy.com` | User must belong to this group |
+| `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` | `OAUTH2_PROXY_GOOGLE_ADMIN_EMAIL` | `admin@gosunergy.com` | Workspace admin the service account impersonates to read group members |
+| `OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON` | `OAUTH2_PROXY_GOOGLE_SERVICE_ACCOUNT_JSON` | `/etc/oauth2-proxy/sa-key.json` | Path **inside the container**; host file is bind-mounted from `ai/oauth2-proxy/sa-key.json` |
 
 ---
 
 ## Cloudflare tunnel routing
 
-The tunnel is token-based (`CLOUDFLARE_TUNNEL_TOKEN`), so its ingress rules are managed in the Cloudflare Zero Trust dashboard, not in a local config file.
+The tunnel is token-based (`CLOUDFLARE_TUNNEL_TOKEN`), so its ingress rules are managed in the Cloudflare Zero Trust dashboard, not in a local config file. Until this step is done, traffic bypasses oauth2-proxy entirely — Cloudflare will keep routing straight to Open WebUI and no group check runs.
 
-1. [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels** → click the tunnel that routes `chat.zeoenergy.com`.
-2. **Public Hostnames** tab → find the row for `chat.zeoenergy.com`.
-3. Change the **Service** from `http://openwebui:8080` to `http://oauth2-proxy:4180`.
-4. **Save**.
+1. [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels**.
+2. Click the tunnel that routes `chat.zeoenergy.com`.
+3. Click **Edit** → **Public Hostnames** tab.
+4. Find the row for `chat.zeoenergy.com` → click **Edit** on that row.
+5. Change the **Service** URL:
+   - From: `http://openwebui:8080`
+   - To: `http://oauth2-proxy:4180`
+6. **Save**.
 
-Traffic reroutes within seconds.
+Traffic reroutes within ~30 seconds. Verify in a fresh incognito window: `chat.zeoenergy.com` should now show oauth2-proxy's Google sign-in flow first (not Open WebUI's login screen), and accounts outside `zeoai.access@zeoenergy.com` should be rejected before reaching Open WebUI.
 
 ---
 
