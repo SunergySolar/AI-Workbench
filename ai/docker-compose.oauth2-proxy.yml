@@ -10,6 +10,8 @@ services:
     networks:
       - shared
     restart: unless-stopped
+    ports:
+      - "${PORT_OAUTH2_PROXY}:4180"
     volumes:
       - ./oauth2-proxy/sa-key.json:/etc/oauth2-proxy/sa-key.json:ro
     environment:

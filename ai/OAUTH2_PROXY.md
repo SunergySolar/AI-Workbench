@@ -27,9 +27,9 @@ docker compose -f ai/docker-compose.oauth2-proxy.yml --env-file .env -p ai-oauth
 
 | Container | Port | Purpose |
 |---|---|---|
-| `oauth2-proxy` | `4180` (internal only) | Google login + group membership check; proxies to `openwebui:8080` on the `ai_shared` network |
+| `oauth2-proxy` | `localhost:4180` (`PORT_OAUTH2_PROXY`) → container `4180` | Google login + group membership check; proxies to `openwebui:8080` on the `ai_shared` network |
 
-The container is **not published to the host**. Cloudflare's tunnel reaches it by Docker service name over the `ai_shared` network.
+Cloudflare's tunnel reaches oauth2-proxy via the docker host IP on port 4180 (published). Reachable over the `ai_shared` docker network at `http://oauth2-proxy:4180` as well.
 
 ---
 
@@ -132,8 +132,8 @@ The tunnel is token-based (`CLOUDFLARE_TUNNEL_TOKEN`), so its ingress rules are 
 3. Click **Edit** → **Public Hostnames** tab.
 4. Find the row for `chat.zeoenergy.com` → click **Edit** on that row.
 5. Change the **Service** URL:
-   - From: `http://openwebui:8080`
-   - To: `http://oauth2-proxy:4180`
+   - From (typical prior value): `http://<host-ip>:8007` (Open WebUI's published host port)
+   - To: `http://<host-ip>:4180` (oauth2-proxy's published host port), or `http://oauth2-proxy:4180` if cloudflared is on the `ai_shared` docker network
 6. **Save**.
 
 Traffic reroutes within ~30 seconds. Verify in a fresh incognito window: `chat.zeoenergy.com` should now show oauth2-proxy's Google sign-in flow first (not Open WebUI's login screen), and accounts outside `zeoai.access@zeoenergy.com` should be rejected before reaching Open WebUI.
