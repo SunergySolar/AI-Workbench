@@ -125,18 +125,59 @@ Every value is sourced from the root `.env` — edit there, never in the compose
 
 ## Cloudflare tunnel routing
 
-The tunnel is token-based (`CLOUDFLARE_TUNNEL_TOKEN`), so its ingress rules are managed in the Cloudflare Zero Trust dashboard, not in a local config file. Until this step is done, traffic bypasses oauth2-proxy entirely — Cloudflare will keep routing straight to Open WebUI and no group check runs.
+**First figure out which flavor of tunnel is actually serving `chat.zeoenergy.com`, then edit the right place.** Cloudflare tunnels come in two flavors and they are edited in completely different places — mixing them up is the single most common failure mode of this setup.
+
+| Flavor | Where the config lives | How you edit it |
+|---|---|---|
+| **Locally-managed** | `/etc/cloudflared/config.yml` on the host (paired with a `credentials-file` JSON in `~/.cloudflared/`) | Edit the file, then `sudo systemctl restart cloudflared` (or the docker restart, if bind-mounted). Dashboard shows a read-only view — edits there are ignored |
+| **Remotely-managed** | Cloudflare Zero Trust dashboard | Dashboard → tunnel → Public Hostnames. Cloudflared uses a `TUNNEL_TOKEN` and pulls config from the edge |
+
+Identify which one is live on your host:
+
+```bash
+ps aux | grep -i cloudflared | grep -v grep
+systemctl status cloudflared 2>/dev/null | head -5
+```
+
+- If a **systemd** `cloudflared.service` is `active (running)`, that's a **locally-managed** tunnel — the config file wins. Edit `/etc/cloudflared/config.yml`.
+- If only a **docker container** (e.g. `ai-cloudflared`) is running and it was launched with `TUNNEL_TOKEN`, that's **remotely-managed**. Edit in the dashboard.
+- If both are running, you have two tunnels and only one is actually receiving traffic for the hostname. Cloudflare DNS decides which — the tunnel whose UUID appears in the `chat.zeoenergy.com` CNAME record is the live one. The other tunnel's config changes have zero effect.
+
+### Locally-managed edit
+
+```yaml
+# /etc/cloudflared/config.yml
+tunnel: <tunnel-uuid>
+credentials-file: /home/<user>/.cloudflared/<tunnel-uuid>.json
+
+ingress:
+  - hostname: chat.zeoenergy.com
+    service: http://localhost:4180     # was http://localhost:8007 pre-oauth2-proxy
+  - service: http_status:404
+```
+
+```bash
+sudo systemctl restart cloudflared
+```
+
+### Remotely-managed edit
 
 1. [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels**.
-2. Click the tunnel that routes `chat.zeoenergy.com`.
-3. Click **Edit** → **Public Hostnames** tab.
-4. Find the row for `chat.zeoenergy.com` → click **Edit** on that row.
-5. Change the **Service** URL:
-   - From (typical prior value): `http://<host-ip>:8007` (Open WebUI's published host port)
-   - To: `http://<host-ip>:4180` (oauth2-proxy's published host port), or `http://oauth2-proxy:4180` if cloudflared is on the `ai_shared` docker network
-6. **Save**.
+2. Click the tunnel that routes `chat.zeoenergy.com` → **Edit** → **Public Hostnames**.
+3. Edit the row for `chat.zeoenergy.com`. Change **Service** to:
+   - `http://<host-ip>:4180` (oauth2-proxy's published host port), or
+   - `http://oauth2-proxy:4180` if cloudflared runs in a container on the `ai_shared` docker network.
+4. **Save**.
 
-Traffic reroutes within ~30 seconds. Verify in a fresh incognito window: `chat.zeoenergy.com` should now show oauth2-proxy's Google sign-in flow first (not Open WebUI's login screen), and accounts outside `zeoai.access@zeoenergy.com` should be rejected before reaching Open WebUI.
+### Verify traffic is actually flowing through oauth2-proxy
+
+Regardless of tunnel flavor, run this end-to-end check from any machine:
+
+```bash
+curl -sfL https://chat.zeoenergy.com/oauth2/ping && echo " → PASS" || echo " → FAIL"
+```
+
+Expected: `OK → PASS`. If it returns HTML or a redirect to `/oauth/google/login`, cloudflared is routing straight to Open WebUI and the group check is being bypassed.
 
 ---
 
@@ -157,6 +198,7 @@ If a single-sign-on experience is desired, Open WebUI can be switched to trusted
 | Sign-in succeeds but 403 "You do not have access" from oauth2-proxy | The user is not in `zeoai.access@zeoenergy.com`, OR domain-wide delegation is misconfigured, OR the impersonated admin email doesn't exist on the tenant |
 | oauth2-proxy logs `googleapi: Error 403: Not Authorized` | Domain-wide delegation missing the `admin.directory.group.readonly` scope, or admin email is not a Workspace admin |
 | oauth2-proxy logs `unable to read service account key` | `sa-key.json` is missing from `ai/oauth2-proxy/` on the host, or the JSON is malformed |
+| oauth2-proxy logs `Admin SDK API has not been used in project <id> before or it is disabled` (403) | The Google Cloud project owning the OAuth client + service account doesn't have the Admin SDK API enabled. Enable at `https://console.developers.google.com/apis/api/admin.googleapis.com/overview?project=<project-id>` — activation takes ~1 minute to propagate |
 | Users still hit Open WebUI directly, bypassing the proxy | Cloudflare tunnel is still routing `chat.zeoenergy.com` to `openwebui:8080` — update the tunnel's public hostname service URL |
 | Revocation not taking effect | `OAUTH2_PROXY_COOKIE_REFRESH` interval hasn't elapsed. Reduce it, or have the user clear cookies for `chat.zeoenergy.com` |
 
