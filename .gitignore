@@ -10,3 +10,4 @@ __pycache__/
 **/node_modules/
 config.json
 ai/oauth2-proxy/*
+unit-tests/classifier/images/*

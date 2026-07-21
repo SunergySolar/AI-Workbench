@@ -161,3 +161,20 @@ curl -X POST https://phoenix-mcp.com/api-token \
 | Changing `LLM_URL` without re-toggling LLM mode | `is_local_llm_active()` returns false |
 | Closing app without stopping llama-server | Orphaned server process |
 | Editing `.env` while app is running | No effect until restart |
+
+## AI Infrastructure — Compose Topology
+
+The Docker Compose services in `ai/` are documented in [`ai/AI_INFRA.md`](ai/AI_INFRA.md), which contains:
+
+- A table linking every `docker-compose.*.yml` to its README.
+- A Mermaid flow diagram showing how the products connect (traffic ingress → oauth2-proxy → openwebui → LiteLLM → vLLM/Kokoro/MADLAD/classifier, plus auxiliary flows).
+- A consolidated host-port table.
+
+**Maintenance rule — keep the diagram in sync.** Whenever a new `docker-compose.*.yml` file is added under `ai/` (or an existing one is renamed, removed, or has its services / ports / cross-service dependencies changed), update `ai/AI_INFRA.md` in the same change:
+
+1. Add / update / remove the row in the **Compose files** table, with a link to the compose file and to its README (create the README if none exists).
+2. Add / update / remove the corresponding node in the Mermaid **Flow diagram** — including edges for every runtime dependency (e.g. `service X calls service Y over ai_shared`).
+3. Update the **Ports at a glance** table with the new host port.
+4. If the service participates in the public traffic path (Cloudflare → oauth2-proxy → …), extend the "Reading the diagram" bullets so the new hop is called out.
+
+The diagram is the single source of truth for how the AI infrastructure fits together — do not add a new compose file without updating it.
