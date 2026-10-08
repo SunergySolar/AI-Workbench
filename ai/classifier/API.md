@@ -37,6 +37,7 @@ One level of subpackages, imported by bare name — the container sets
 ai/classifier/
   main.py              FastAPI app, lifespan, router registration — nothing else
   config.py            every constant and env knob in the service, one file
+  db.py                the one asyncpg pool on classifier-db, shared by the three stores
   logger.py            the one "classifier" logger every module imports
   middleware.py        correlation IDs: the ContextVar, the filter, the middleware
   metrics.py           the Prometheus objects produced in one module, read in none
@@ -51,6 +52,7 @@ ai/classifier/
     reference_schemas.py  ReferenceRequest / ReferencePatch — POST and PATCH /references
     references.py      the /references routes: save a worked example (a "reference" job
                        builds it), list, read, files, edit, delete
+    usage.py           GET /jobs/{id}/usage and GET /usage — the model calls a job made
   analysis/            the engine
     loading.py         bytes → Document: content type, EXIF, kind, URL + SSRF, every page
                        (+ the submit-time SVG image inliner)
@@ -82,7 +84,7 @@ ai/classifier/
     sweeper.py         the TTL task, the DELETE hook, the disk gauges
   references/          stored worked examples — never imports analysis or llm
     model.py           the Reference row, the id and file-name grammar, guides_llm
-    store.py           ReferenceRegistry (`reference_examples` in classifier.db), the
+    store.py           ReferenceRegistry (`reference_examples` in classifier-db), the
                        sweeper-less file store at CLASSIFIER_REFERENCE_DIR, reconcile, gauges
     resolve.py         an /assess request's `references` against the store, at submit: the
                        plan the worker follows, inherited criteria, the `auto` pool
@@ -92,6 +94,8 @@ ai/classifier/
     prompts.py         the single-criterion scoring prompt (with reference examples), the
                        loop's two small ones, the reference describe and selection prompts
     client.py          LLM_CALLS (the process-wide limit), call_vllm, call_vllm_json, the encoder
+    usage.py           UsageStore (`llm_calls` in classifier-db): one row per model request,
+                       attributed to its job / criterion / item through context vars
     validate.py        find the answer, clamp it, derive the verdict from the score
     boxes.py           the bounding-box enforcement loop
   cv/                  REGISTRY + get_detector in __init__.py
@@ -106,12 +110,13 @@ ai/classifier/
     queue.py           ClassifierQueue + the registry / queue / sweeper singletons
   bin/
     grounding_experiment.py   operator tool — runs where the model is
+    migrate_sqlite_to_postgres.py  one-shot: the old /data/classifier.db → classifier-db
 ```
 
 Import direction is strictly one way:
 
 ```
-config → logger / metrics / utils → api.criterion_options → api.schemas
+config → logger / metrics / utils / db → api.criterion_options → api.schemas
        → cv, llm, detector, regions, references → analysis → jobs → api (routers) → main
 ```
 
@@ -150,6 +155,21 @@ uses. The endpoint shapes and response fields are documented there.
 
 ### Concurrency and durability
 
+**Where the state lives.** Every row the classifier keeps is in one Postgres
+database, the compose-managed `classifier-db` container (`postgres:17-alpine`,
+on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
+(`jobs`, `common.jobs.postgres.PostgresRegistry`), saved references
+(`reference_examples`) and one row per model request (`llm_calls`). The three
+stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT +
+CLASSIFIER_MAX_LLM_CALLS + 8` connections). There is **no SQLite fallback**:
+with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
+refuses to start and says why. The same database is federated into Trino as
+the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
+references and per-call cost can be queried from Trino and Superset. Files
+stay on the `classifier_data` volume: queued payloads, artifact directories
+and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
+sorts object keys, and `per_criterion_scores` lists criteria in request order.
+
 The jobs table **is** the queue. Inside a job the unit of work is **(criterion,
 item)** — one criterion on one page of one document in, one result out (a
 `text` criterion with `options.scope: "document"` is one unit per document) —
@@ -169,8 +189,8 @@ Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
 payload landing on disk; workers never claim it.
 
 Job inputs (the document bytes, resolved AT SUBMIT, plus the validated
-criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, same volume
-as the DB) and deleted when the job reaches a terminal phase. On startup the
+criteria) are written to `PAYLOAD_DIR` (default `/data/payloads`, on the
+`classifier_data` volume) and deleted when the job reaches a terminal phase. On startup the
 service requeues any `processing` rows a previous container left behind and
 sweeps orphaned payload files, so a restart mid-job re-runs the job rather
 than losing it.
@@ -209,9 +229,10 @@ description), `other`:
 The kind is derived from the label each call site already passes (`score/…`,
 `bbox/…`, `refine/…`, `verify/…`, `reference/select…`,
 `reference/describe`), never from a criterion name, so the label set stays
-small. Every request also writes one INFO log line — `llm call kind=score
-label=score/<name> attempt=1 12.34s prompt=… cached=… completion=… reasoning=…`
-— so one slow job can be read call by call. Prefill vs reasoning vs retries:
+small. Every request also writes one INFO log line — `llm call job=<id>
+kind=score label=score/<name> attempt=1 12.34s prompt=… cached=… completion=…
+reasoning=…` — so one slow job can be read call by call, and one row in the
+`llm_calls` table, which outlives the log (see [§ Model usage](#model-usage)). Prefill vs reasoning vs retries:
 `rate(classifier_llm_cached_prompt_tokens_total) /
 rate(classifier_llm_prompt_tokens_total)` is the cache hit share,
 `rate(…reasoning_tokens_total) / rate(…completion_tokens_total)` the share of
@@ -221,6 +242,52 @@ generation spent thinking, and `classifier_llm_call_seconds_count` against
 the server-wide hit rate across chat traffic too.
 
 ### Deploying this version
+
+**State moved from SQLite to Postgres (`classifier-db`).** The classifier no
+longer reads `/data/classifier.db`; it starts on an empty `classifier-db`, and
+its FIRST start prunes what that empty database does not know — queued
+payloads whose row is missing, and every job artifact directory whose row is
+missing. So the old data is copied across BEFORE the new container starts:
+
+1. **Drain the queue** (`classifier_job_queue_depth` at 0) — not required (a
+   queued job whose payload is still on disk is carried over and runs), but
+   it leaves nothing half-done.
+2. Set `CLASSIFIER_TRINO_READER_PASSWORD` in `.env` (`openssl rand -hex 32`):
+   the read-only Trino role is created on the first start of an empty
+   `classifier_db` volume (re-runnable by hand, see
+   `ai/classifier/db-init/10-trino-reader.sh`). `CLASSIFIER_DB_USER` /
+   `_PASSWORD` / `_NAME` default to `classifier`.
+3. `make build classifier`, then `make up classifier classifier-db` — the
+   database only; the old classifier keeps running on SQLite.
+4. `docker stop classifier`, then copy the data with a one-off container of
+   the new image (same volume, same env, never starts the app):
+
+   ```bash
+   docker compose -f ai/classifier/docker-compose.classifier.yml --env-file .env \
+       -p ai-classifier run --rm --no-deps classifier \
+       uv run python bin/migrate_sqlite_to_postgres.py        # --dry-run to count first
+   ```
+
+   It copies `reference_examples` (the one that matters — references never
+   expire and their files are named by these ids), `jobs` and `llm_calls`,
+   prints read / inserted / already present / unreadable per table, is
+   idempotent (`ON CONFLICT DO NOTHING`; a second run inserts 0) and never
+   touches the SQLite file. A job that was not finished keeps its phase when
+   its payload is on disk, and arrives `failed` ("resubmit") when it is not.
+   A real (not `--dry-run`) run also writes `/data/classifier.db.migrated`
+   beside the old file — the marker the startup guard below looks for.
+5. `make up classifier`. Remove `/data/classifier.db` (and the marker) by hand
+   once the counts look right. **Startup guard:** while the old file exists
+   WITHOUT the marker, startup logs an ERROR and skips the orphan payload
+   sweep and the artifact sweeper (TTL included), because a payload or an
+   artifact directory with no Postgres row is, in that state, data the
+   migration has not given a row yet. So starting the new container first
+   loses nothing: run `docker exec classifier uv run python
+   bin/migrate_sqlite_to_postgres.py`, then `make up classifier` again to turn
+   the sweeps back on.
+6. `make up trino` (a recreate: the coordinator's env gained
+   `CLASSIFIER_DB_NAME` / `CLASSIFIER_TRINO_READER_PASSWORD`), then check
+   `SELECT * FROM postgres_classifier.public.llm_calls LIMIT 5`.
 
 **Recreate `muse-glimmer` FIRST, with `--limit-mm-per-prompt '{"image": 3}'`.**
 A reference-guided scoring call sends up to three images, and a vLLM started
@@ -1149,7 +1216,7 @@ against an example that is the whole page is a 400 at submit (explicit ids).
 They live in their own root, `CLASSIFIER_REFERENCE_DIR`, which nothing sweeps
 (the artifact sweeper deletes every directory whose job row is gone, which is
 exactly what a reference must survive), with their rows in the
-`reference_examples` table of the same `classifier.db`. The creation job
+`reference_examples` table of the same `classifier-db` database. The creation job
 expires on `JOB_TTL_HOURS` like any job; the reference has already copied what
 it needs. `CLASSIFIER_REFERENCE_MAX_COUNT` (500) is the only bound on their
 disk.
@@ -1165,6 +1232,74 @@ Metrics: `classifier_references{status}`, `classifier_reference_bytes`,
 `classifier_reference_dirs`, `classifier_references_created_total{outcome}`,
 `classifier_reference_describe_total{outcome}`,
 `classifier_reference_calls_total{kind=selection|scoring, outcome}`.
+
+---
+
+## Model usage
+
+Every HTTP request the classifier makes to the vision model
+(`VISION_LLM_API` / `VISION_LLM_MODEL`) — each scoring call, each box-loop
+ask / refine / verify, each `references: "auto"` selection and reference
+description, **and each parse retry** — is written as one row of the
+`llm_calls` table in `classifier-db` (the same Postgres database as the jobs
+and `reference_examples` tables — and so readable from Trino as
+`postgres_classifier.public.llm_calls`). Failed
+requests are recorded too. The Prometheus counters in
+[§ Concurrency and durability](#concurrency-and-durability) say where the
+model's time goes across the process; these rows say what **one job** cost.
+
+**What a row holds.**
+
+| Column | What |
+|---|---|
+| `id` | Row id, in insert order |
+| `job_id` / `job_type` | The job that made the call (`assess` \| `reference`); `null` for a call made outside a job (none today) |
+| `request_id` | The correlation id of the HTTP request that queued the job (`X-Request-ID`) |
+| `started_at` | When the request went out (`TIMESTAMPTZ`; the API returns it as a UTC ISO string) (after its `CLASSIFIER_MAX_LLM_CALLS` slot was granted) |
+| `label` / `kind` | The call site's label (`score/<name>`, `bbox/<name>#2`, `reference/select#3`, …) and its kind — the same `score` / `ask` / `refine` / `verify` / `select` / `describe` / `other` the metrics use |
+| `criterion` / `item` / `document` | The unit it was for. A selection call has its `item` and `document` but **no** `criterion` — it is made once per item on behalf of every criterion there; a `scope: "document"` unit has `item` `null`; a reference's describe call has none of them |
+| `attempt` | 1-based parse-retry number (`MAX_LLM_RETRIES`) |
+| `model_requested` / `model_reported` | The `model` the request sent, and the one the response named |
+| `api_url` / `max_tokens` | `VISION_LLM_API`, and the request's completion budget |
+| `outcome` | `ok` (a 2xx) \| `error` (transport failure, timeout, non-2xx) |
+| `http_status` / `error` | For an error: the status of a non-2xx (`null` for a timeout or a refused connection) and `"<ExceptionClass>: <message>"` |
+| `finish_reason` | `stop`, or `length` when the budget ran out (often mid-reasoning, which then costs a retry) |
+| `seconds` | Time inside the slot — the model, not the wait for a slot |
+| `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` | From the response's `usage`; `null` when not reported. `cached_tokens` is only reported when `muse-glimmer` runs `--enable-prompt-tokens-details`; `reasoning_tokens` is part of `completion_tokens` |
+| `usage` | The response's `usage` object verbatim (a `JSONB` column), so nothing vLLM reports is lost — multimodal token counts, for one |
+
+**How a call knows its job.** Context variables, not arguments: the queue's
+`handle_job` sets the job id and type, and the scheduler sets the unit — item
+and document before the selection call, and the criterion too around each
+evaluator. asyncio copies them into every task underneath, and every unit is
+its own task, so concurrent units never see each other's. The write happens
+after the request's slot is released, and it **never fails the call**: an
+accounting error is logged and counted in
+`classifier_llm_usage_write_errors_total` — the only sign that a job's usage
+is missing calls.
+
+**Retention: the rows outlive the job.** The TTL sweeper removes expired job
+rows and artifact directories and leaves `llm_calls` alone, so a job's cost
+stays readable at `GET /jobs/{id}/usage` after the job itself is gone
+(`job_present: false`). The only thing that removes a job's rows is `DELETE
+/jobs/{id}` — which does so even when the job row has already expired (it
+then answers 404 for the row). The table grows by one small row per model
+request; prune it by hand (`DELETE FROM llm_calls WHERE started_at < '…'` in
+`classifier-db`, e.g. `docker exec -it classifier-db psql -U classifier`) if
+that ever matters.
+
+**Where to read it.**
+
+* `result.usage` on a completed job — the totals (see [§ Result shape](#result-shape)).
+  A failed job has no result; its usage is still at the URL.
+* [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage) — every call, the totals,
+  and the same totals per kind, outcome and criterion.
+* [`GET /usage`](#get-usage) — totals across jobs, by kind and by UTC day,
+  filtered by time window and job type.
+
+Token totals are sums over the calls that reported the number, and `null`
+(not `0`) when none did — so a missing `--enable-prompt-tokens-details` shows
+as `cached_tokens: null`, not as a 0% cache hit rate.
 
 ---
 
@@ -1260,7 +1395,13 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
   "detector": {"configured": false, "url_host": null, "calls": 0, "…": "…", "used": false},
   "artifacts": {"files": [ … ], "items": [{"item": 0, "layers": {"svg": "/jobs/abc123/artifacts/p0.svg", "…": "…"}},
                                           {"item": 1, "layers": {"…": "…"}}],
-                "zip_url": "/jobs/abc123/artifacts.zip", "…": "…"}
+                "zip_url": "/jobs/abc123/artifacts.zip", "…": "…"},
+  "usage": {"calls": 4, "errors": 0, "seconds": 38.412,
+            "prompt_tokens": 9120, "cached_tokens": null, "completion_tokens": 1870,
+            "reasoning_tokens": 1610, "total_tokens": 10990, "models": ["muse-glimmer"],
+            "first_call_at": "2026-07-30T15:00:01.204311+00:00",
+            "last_call_at": "2026-07-30T15:00:06.880102+00:00",
+            "usage_url": "/jobs/abc123/usage"}
 }
 ```
 
@@ -1277,6 +1418,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
 | `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference` |
 | `request` | `{"criteria": [...]}` — the criteria exactly as validated (`depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
+| `usage` | What the job's vision-model requests cost — the `totals` block of [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage): `calls` (every HTTP request, parse retries included), `errors`, `seconds`, `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` (`null` when no call reported one), `models`, `first_call_at` / `last_call_at`, and `usage_url` for the per-call rows. `calls: 0` when nothing asked the model (`text` / `cv` criteria only). Added by the queue after the runner returns, so a `reference` job's result carries it too. See [§ Model usage](#model-usage) |
 
 **Every criterion has the same keys**, whatever its type or status. The keys
 that existed before describe the AGGREGATED answer:
@@ -1877,6 +2019,10 @@ themselves**. Terminal jobs only. Gauges: `classifier_artifact_bytes`,
 `DELETE /jobs/{id}` removes the directory with the row. `DELETE
 /jobs/{id}/artifacts` frees the disk but keeps the row and its inline regions.
 
+**Model-usage rows are exempt too.** The sweeper never touches the `llm_calls`
+table: a job's usage outlives it, and only `DELETE /jobs/{id}` removes it
+([§ Model usage](#model-usage)).
+
 **References are exempt.** They live in their own root,
 `CLASSIFIER_REFERENCE_DIR` (`/data/references`, the same volume), which the
 sweeper never touches — it deletes any directory whose job row is gone, and a
@@ -2380,6 +2526,92 @@ directory. Afterwards the other artifact endpoints answer **410**.
 
 ---
 
+### `GET /jobs/{job_id}/usage`
+
+Every vision-model request the job made, in the order they were made, with
+the totals ([§ Model usage](#model-usage) has what each field means).
+
+```bash
+curl http://localhost:8005/jobs/abc123/usage | jq '{totals, by_kind}'
+curl http://localhost:8005/jobs/abc123/usage | jq '.calls[] | {label, criterion, item, seconds, prompt_tokens, completion_tokens}'
+```
+
+```json
+{
+  "job_id": "abc123",
+  "job_present": true,
+  "job_type": "assess",
+  "totals": {"calls": 4, "errors": 0, "seconds": 38.412, "prompt_tokens": 9120,
+             "cached_tokens": null, "completion_tokens": 1870, "reasoning_tokens": 1610,
+             "total_tokens": 10990, "models": ["muse-glimmer"],
+             "first_call_at": "2026-07-30T15:00:01.204311+00:00",
+             "last_call_at": "2026-07-30T15:00:06.880102+00:00"},
+  "by_kind": {"ask": {"calls": 1, "…": "…"}, "score": {"calls": 2, "…": "…"},
+              "verify": {"calls": 1, "…": "…"}},
+  "by_outcome": {"ok": {"calls": 4, "…": "…"}},
+  "by_criterion": [{"criterion": "has a house", "calls": 3, "errors": 0, "seconds": 29.1, "…": "…"},
+                   {"criterion": "has a roof", "calls": 1, "…": "…"}],
+  "calls": [
+    {"id": 812, "job_id": "abc123", "job_type": "assess", "request_id": "req-xyz",
+     "started_at": "2026-07-30T15:00:01.204311+00:00", "label": "score/has a house",
+     "kind": "score", "criterion": "has a house", "item": 0, "document": 0, "attempt": 1,
+     "model_requested": "muse-glimmer", "model_reported": "muse-glimmer",
+     "api_url": "http://muse-glimmer:8000/v1/chat/completions", "max_tokens": 8192,
+     "outcome": "ok", "http_status": null, "error": null, "finish_reason": "stop",
+     "seconds": 14.87, "prompt_tokens": 2310, "cached_tokens": null,
+     "completion_tokens": 512, "reasoning_tokens": 455, "total_tokens": 2822,
+     "usage": {"prompt_tokens": 2310, "completion_tokens": 512, "total_tokens": 2822,
+               "completion_tokens_details": {"reasoning_tokens": 455}}},
+    {"…": "…"}
+  ]
+}
+```
+
+Every block in `by_kind`, `by_outcome` and `by_criterion` has the same keys
+as `totals` (without `models` / `first_call_at` / `last_call_at`).
+`by_criterion` is a list because the calls that belong to no criterion — the
+per-item selection, a reference's description — are grouped under
+`"criterion": null`. `result.usage` on the job is `totals` plus `usage_url`.
+
+**200** for a job that has not called the model (yet, or at all) — zero
+`calls`. **200 with `job_present: false`** once the job has expired: the
+usage rows outlive it. **404** only when there is neither a job row nor any
+usage row — an unknown id, or a job removed with `DELETE /jobs/{job_id}`.
+
+---
+
+### `GET /usage`
+
+Model usage across jobs: the totals (plus `jobs`, the distinct jobs counted),
+by call kind, and by UTC day. Includes the calls of jobs that have since
+expired.
+
+| Param | Effect |
+|---|---|
+| `since` | Inclusive lower bound on a call's `started_at` — an ISO date (`2026-10-01`, its midnight UTC) or datetime (`2026-10-01T08:00:00Z`; no offset means UTC) |
+| `until` | Exclusive upper bound, same forms — `since=2026-10-01&until=2026-10-02` is one UTC day |
+| `job_type` | Only calls made by jobs of this type: `assess` \| `reference` |
+
+```bash
+curl "http://localhost:8005/usage?since=2026-10-01&job_type=assess" | jq '{totals, by_day}'
+```
+
+```json
+{
+  "filter": {"since": "2026-10-01T00:00:00.000000+00:00", "until": null, "job_type": "assess"},
+  "totals": {"calls": 1240, "errors": 3, "seconds": 9841.2, "prompt_tokens": 2810400,
+             "cached_tokens": null, "completion_tokens": 561200, "reasoning_tokens": 488100,
+             "total_tokens": 3371600, "models": ["muse-glimmer"], "jobs": 212},
+  "by_kind": {"score": {"calls": 880, "…": "…"}, "ask": {"…": "…"}, "…": "…"},
+  "by_day": [{"day": "2026-10-01", "calls": 190, "…": "…"}, {"day": "2026-10-02", "…": "…"}]
+}
+```
+
+**400** for a `since` / `until` that is not an ISO date or datetime, or a
+`since` that is not before `until`.
+
+---
+
 ### `GET /jobs/{job_id}`
 
 Poll for the status and result of a submitted job.
@@ -2422,10 +2654,13 @@ curl "http://localhost:4001/v1/classifier/jobs?limit=10" -H "Authorization: Bear
 
 ### `DELETE /jobs/{job_id}`
 
-Delete a job record **and its artifact directory** (text layers included).
-Returns `204 No Content`; **404** when the job is unknown. The directory
-removal is wired in as `common.jobs.router.build_router`'s `on_delete` hook, so
-a deleted row can never leave files that nothing points at.
+Delete a job record, **its artifact directory** (text layers included) **and
+its model-usage rows** (`llm_calls`). Returns `204 No Content`; **404** when
+the job is unknown. Both removals are wired in as
+`common.jobs.router.build_router`'s `on_delete` hook, so a deleted row can
+never leave files that nothing points at. The hook runs before the row check:
+a DELETE on a job the TTL sweeper already removed still deletes its usage
+rows (the one thing the sweeper leaves behind) and then answers 404.
 
 ---
 
@@ -2481,11 +2716,16 @@ uv run --package classifier python unit-tests/classifier/regions_report.py
 uv run --package classifier python unit-tests/classifier/regions_report.py --local
 ```
 
-`--local` mounts this app in-process with `TestClient` on a throwaway `/data`,
-so everything but the vision model is verifiable with no container and no GPU.
-Setup, how to read the report, and how to add a case:
+`--local` mounts this app in-process with `TestClient` on a throwaway `/data`
+and a throwaway Postgres database (created on `TEST_POSTGRES_DSN`, dropped
+after the run), so everything but the vision model is verifiable with no
+container and no GPU. Setup, how to read the report, and how to add a case:
 [`unit-tests/classifier/REGIONS_REPORT.md`](../../unit-tests/classifier/REGIONS_REPORT.md).
 
 The unit tests (`unit-tests/classifier/test_*.py`) script the model at
 `llm.client._send` / `call_vllm` / `call_vllm_json` and never touch the
-network.
+network. Everything that runs the app's lifespan or touches the jobs,
+references or usage tables needs Postgres: with `TEST_POSTGRES_DSN` set the
+session creates one `classifier_test_<pid>_<hex>` database and drops it at the
+end; without it those tests skip (marker `postgres` / fixture
+`need_postgres`, see `unit-tests/classifier/conftest.py`).
