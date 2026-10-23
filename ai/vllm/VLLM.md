@@ -1,39 +1,34 @@
 # vLLM — Multi-Model Serving
 
-> **Windows / WSL2 compatibility note:** vLLM v0.22.0+ (the current `latest` image) uses a V1 engine that requires CUDA Unified Virtual Addressing (UVA), which is unavailable in WSL2's paravirtualized GPU driver. Running the latest image on Windows Docker with WSL2 will fail at startup with `RuntimeError: UVA is not available`. Pin the image to `vllm/vllm-openai:v0.6.6` until upstream adds a WSL2-compatible code path.
-
-Run multiple models simultaneously, each in its own container on a different port. Hit any model at the standard OpenAI-compatible endpoint (`/v1/chat/completions`) — pick which model by specifying `"model": "qwen"` or `"model": "llama"` in your request body.
+Run several models at once, each in its own container on its own host port, each serving the OpenAI-compatible API (`/v1/chat/completions`). Pick the model with `"model": "<served name>"` in the request body. Chat traffic normally reaches them through LiteLLM's chain aliases, not directly ([LITELLM.md](../litellm/LITELLM.md)).
 
 ### Quick start
 
+From the repo root on the box, start a model by service name (`make up vllm` alone starts every service in the Makefile's list, which needs all the GPUs):
+
 ```bash
-docker compose -f ai/vllm/docker-compose.vllm.yml up -d
+make up vllm qwen3.8-solo
 ```
 
-This launches two containers by default:
+| Service | Host port (`.env`) | Model | Served name |
+|---|---|---|---|
+| `qwen3.6` | `PORT_VLLM_QWEN36` (`8002`) | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | `qwen3.6` |
+| `qwen3.8` | `PORT_VLLM_QWEN38` (`8003`) | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | `qwen3.8` |
+| `vllm-qwen-vl` | `PORT_VLLM_QWEN_VL` (`8006`) | `Qwen/Qwen2.5-VL-7B-Instruct` | see the compose file |
+| `muse-glimmer` | `PORT_VLLM_MUSE_GLIMMER` (`8018`) | `meta-models/Muse-Glimmer-30B` | `muse-glimmer` |
+| `qwen3.8-solo` | `PORT_VLLM_QWEN38_SOLO` (`8019`) | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | `qwen3.8-solo` |
 
-| Container | Port | Model |
-|---|---|---|
-| `vllm-qwen` | `localhost:8002` | `Qwen/Qwen2.5-3B-Instruct` |
-| `vllm-llama` | `localhost:8003` | `meta-llama/Llama-3.2-3B-Instruct` |
-
-Test with:
+`muse-glimmer` and `qwen3.8` share a GPU pair — run one of them (§ Muse Glimmer 30B). Test with:
 
 ```bash
-# Qwen on port 8002
-curl http://localhost:8002/v1/chat/completions \
+curl http://localhost:8019/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "qwen", "messages": [{"role": "user", "content": "Hello!"}]}'
-
-# Llama on port 8003
-curl http://localhost:8003/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "llama", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "qwen3.8-solo", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
 ### How it works
 
-Each service in `ai/vllm/docker-compose.vllm.yml` is a standalone vLLM instance. The `--model` flag on the command line tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
+Each service in `ai/vllm/docker-compose.vllm.yml` is a standalone vLLM instance. The model argument on its command line (`vllm serve <model>` or `--model`) tells vLLM which HuggingFace model to load. Each container gets its own GPU memory allocation and listens on a different host port, so they run in parallel without conflict.
 
 For strategies on dividing GPU resources between containers (time-slicing, MIG, `--gpu-memory-utilization` tuning), see [GPU_SHARING_GUIDE.md](../GPU_SHARING_GUIDE.md).
 
@@ -165,7 +160,7 @@ Applied via a bind mount and the `--chat-template` flag:
 
 **`device_ids` vs `count`.** `count: all` exposes every GPU and lets vLLM take the first N it needs — fine when a service owns the box, wrong when two services must share it. `device_ids: ['2']` sets `NVIDIA_VISIBLE_DEVICES=2`, so the container sees exactly one card and vLLM's `cuda:0` *is* host GPU 2. Indices follow `nvidia-smi` order and are 0-based, so "slot 3" is `'2'`. If a driver update or reseat changes enumeration, pin by UUID instead: `nvidia-smi -L` prints `GPU-xxxxxxxx-…` ids that Docker accepts verbatim in `device_ids`. Compose rejects `count` and `device_ids` on the same entry — use one.
 
-**Why 3 sequences.** Qwen3.8-27B is a hybrid: 16 of its 64 layers are full attention (4 KV heads × 256 head_dim), the rest are linear attention with a small fixed state. In BF16 that is 64 KiB of KV per token, so a full 131072-token sequence costs ~8 GiB. One A6000 at 0.90 utilisation leaves ~21 GiB for KV after ~19 GiB of INT4 weights + MTP head and ~3 GiB of activations — roughly 2½ max-length sequences, which is why the cap is 3 (the same figure `qwen3.6`, the same architecture on one card, has run with). As always the cap is a ceiling: a dozen 8k-token chats fit fine; three 128k ones will queue briefly. `--kv-cache-dtype fp8` would double that if you ever need it.
+**Why 3 sequences.** Qwen3.8-27B is a hybrid: 16 of its 64 layers are full attention (4 KV heads × 256 head_dim), the rest are linear attention with a small fixed state. In BF16 that is 64 KiB of KV per token, so a full 131072-token sequence costs ~8 GiB. One A6000 at 0.90 utilisation leaves ~21 GiB for KV after ~19 GiB of INT4 weights + MTP head and ~3 GiB of activations — roughly 2½ max-length sequences, which is why the cap is 3 (the same figure `qwen3.6`, the same architecture on one card, has run with). As always the cap is a ceiling: a dozen 8k-token chats fit fine; three 128k ones will queue briefly. `--kv-cache-dtype fp8` would double that if you ever need it. The classifier also has a `qwen3.8-solo` registry entry (`ai/classifier/models.yaml`, `max_concurrent: 1`), a route-policy benchmark candidate: when a job selects it, it holds at most one of these three sequences, and while it does the overflow hook can see `vllm:num_requests_waiting` rise sooner for chat.
 
 **What can co-run.** With three A6000s and these services at 0.90 utilisation:
 
@@ -174,6 +169,8 @@ Applied via a bind mount and the `--chat-template` flag:
 | `muse-glimmer` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` **or** `qwen3.6` (both TP=1) — but not both, and `qwen3.6` uses `count: all`, so it grabs GPU 0 and collides with muse; give it a `device_ids` too if you want that pairing |
 | `qwen3.8` (TP=2, first two cards) | 0, 1 | `qwen3.8-solo` on GPU 2 — pointless duplication, but it works |
 | `glm5.2` / `qwen3.8-flash` (llama.cpp, `--tensor-split 1,1,1`) | 0, 1, 2 | nothing — they use all three cards |
+
+**GPU 2 is shared with the detector.** `ai/detector` pins `device_ids: ['2']` too and runs OWLv2 (fp16, one inference at a time) in the headroom `qwen3.8-solo`'s `--gpu-memory-utilization 0.90` leaves. Raising that utilisation, growing `--max-num-seqs` / `--max-model-len`, or pointing `DETECTOR_MODEL` at a larger checkpoint can OOM one of the two; `DETECTOR_DEVICE=cpu` is the detector's fallback ([DETECTOR.md](../detector/DETECTOR.md)).
 
 `qwen3.8` and `qwen3.8-solo` are separate LiteLLM aliases on purpose. Listing both under one `model_name` would make LiteLLM round-robin onto whichever is down and burn a retry + cooldown per request; keep them distinct and point clients at the one that is up.
 
@@ -203,13 +200,13 @@ The `muse-glimmer` service serves [`meta-models/Muse-Glimmer-30B`](https://huggi
       --limit-mm-per-prompt '{"image": 3}'   # classifier references — see Multimodal
 ```
 
-**vLLM version — pinned, not `latest`.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)); **v0.29.0** (2026-09-09) adds a DFlash draft RoPE-layout fix and a Muse Glimmer LoRA fix, and is what every service in this compose file now pins except `qwen3.8`, which is held at `v0.27.1` (the build it was already running) until it has been tried on v0.29.0. Meta's recipe names `v0.28.0` as the minimum. The whole file moved off `latest` because `docker compose up -d` never re-pulls a `latest` tag that is already cached on the host — a stale pre-0.28 `latest` boots the container and then dies with:
+**vLLM version — pinned, not `latest`.** Model support, the `muse_glimmer` reasoning + tool-call parsers, and DFlash2 all landed in **vLLM v0.28.0** (2026-08-26; [#51655](https://github.com/vllm-project/vllm/pull/51655), [#52816](https://github.com/vllm-project/vllm/pull/52816)); **v0.29.0** (2026-09-09) adds a DFlash draft RoPE-layout fix and a Muse Glimmer LoRA fix, and is what every service in this compose file now pins except `qwen3.8` and its one-card copy `qwen3.8-solo`, which are held at `v0.27.1` (the build `qwen3.8` was already running) until they have been tried on v0.29.0. Meta's recipe names `v0.28.0` as the minimum. The whole file moved off `latest` because `docker compose up -d` never re-pulls a `latest` tag that is already cached on the host — a stale pre-0.28 `latest` boots the container and then dies with:
 
 ```
 KeyError: 'invalid tool call parser: muse_glimmer (chose from { apertus, ..., qwen3_coder, qwen3_xml, ... })'
 ```
 
-If you see that, the running image is too old — it is not a typo in the parser name. Bumping a pin is a deliberate edit + `make up vllm <service>` (compose pulls a tag it doesn't have locally); bump one service at a time so a regression is attributable. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
+If you see that, the running image is too old — it is not a typo in the parser name. Bumping a pin is a deliberate edit + `make up vllm <service>` (compose pulls a tag it doesn't have locally); bump one service at a time so a regression is attributable. LiteLLM's overflow hook counts prompts with each chain backend's `POST /tokenize` (server root, outside `/v1`), verified at v0.27.1 and v0.29.0 ([LITELLM.md § The overflow hook](../litellm/LITELLM.md#the-overflow-hook)) — after bumping `qwen3.8-solo` or `muse-glimmer`, check `/tokenize` still answers with `count` and `max_model_len`. Meta's own recipe is at [recipes.vllm.ai](https://recipes.vllm.ai/meta-models/Muse-Glimmer-30B).
 
 **Why TP=2 works.** The text stack has 32 attention heads and **2 KV heads**, so the only legal TP sizes are 1 and 2 (see *Picking TP size* above). Two A6000s (2 × 48 GB) comfortably clear Meta's 72 GB minimum:
 
@@ -227,9 +224,9 @@ Available KV cache memory: 8.64 GiB            (per TP worker)
 GPU KV cache size: 1,103,211 tokens, Maximum concurrency for 262144 tokens per request: 4.21x
 ```
 
-**Why `--max-num-seqs` is 8.** It is a **ceiling** on sequences scheduled at once, not a reservation: vLLM admits a request when the KV blocks for its *prompt* are free, so the pool, not the flag, decides what actually runs. 4.21x means **at most 4 full-length (262144-token) requests fit at once**. At 4 that was a guarantee — every admitted request could grow to the full context. At 8 it no longer is: vLLM can admit more long requests than the pool can finish together, and when decode runs out of blocks it **preempts** the newest one (frees its KV and recomputes it later). That costs latency for that request, not a failure, and only happens when several very long chats overlap; classifier-sized calls never get near it. The traffic this service actually sees is far smaller: a classifier call is at most ~30k tokens (one page image + at most `CLASSIFIER_TEXT_CHAR_BUDGET`'s 60k characters ≈ 15k tokens of text + an 8192-token answer budget), so eight of them use about 22% of the pool. The flag used to be 4, which capped the batch at 4 while most of the KV pool sat unused. The 8 sequences are split by convention, not by vLLM: the classifier takes at most **6** (`CLASSIFIER_MAX_LLM_CALLS`, `CLASSIFIER_MAX_UNITS_PER_JOB`) and **2** stay free for chat, because `muse-glimmer` is in LiteLLM's chain aliases (order 1 of `local-reasoning`, order 2 of `local-general` / `-code` / `-private`) and the overflow hook ([`ai/litellm/LITELLM.md § Chain aliases and the overflow hook`](../litellm/LITELLM.md#chain-aliases-and-the-overflow-hook)) drops it from those chains — spilling chat to the next order, eventually Claude — once `vllm:num_requests_waiting` has been above 0 for `OVERFLOW_BUSY_AFTER_S`. A classifier that could fill all 8 would make every chat turn that reaches this model wait, and so spill.
+**Why `--max-num-seqs` is 8.** It is a **ceiling** on sequences scheduled at once, not a reservation: vLLM admits a request when the KV blocks for its *prompt* are free, so the pool, not the flag, decides what actually runs. 4.21x means **at most 4 full-length (262144-token) requests fit at once**. At 4 that was a guarantee — every admitted request could grow to the full context. At 8 it no longer is: vLLM can admit more long requests than the pool can finish together, and when decode runs out of blocks it **preempts** the newest one (frees its KV and recomputes it later). That costs latency for that request, not a failure, and only happens when several very long chats overlap; classifier-sized calls never get near it. The traffic this service actually sees is far smaller: a classifier call is at most ~30k tokens (one page image + at most the `muse-glimmer` entry's `text_char_budget` of 60k characters (`ai/classifier/models.yaml`) ≈ 15k tokens of text + an 8192-token answer budget), so eight of them use about 22% of the pool. The flag used to be 4, which capped the batch at 4 while most of the KV pool sat unused. The 8 sequences are split by convention, not by vLLM: the classifier takes at most **6** (the `muse-glimmer` entry's `max_concurrent` in [`ai/classifier/models.yaml`](../classifier/models.yaml), and `CLASSIFIER_MAX_UNITS_PER_JOB`) and **2** stay free for chat, because `muse-glimmer` is in LiteLLM's chain aliases (order 1 of `local-reasoning`, order 2 of `local-general` / `-code` / `-private`) and the overflow hook ([`ai/litellm/LITELLM.md § Chain aliases and the overflow hook`](../litellm/LITELLM.md#chain-aliases-and-the-overflow-hook)) drops it from those chains — spilling chat to the next order, eventually Claude — once `vllm:num_requests_waiting` has been above 0 for `OVERFLOW_BUSY_AFTER_S`. A classifier that could fill all 8 would make every chat turn that reaches this model wait, and so spill.
 
-**Expect a sublinear gain.** Doubling the batch does not double throughput here: DFlash's speedup (see below) is largest single-stream and shrinks as the batch grows, and every sequence shares the same two GPUs' compute. Measure rather than assume — the classifier records per-call latency and prompt / cached / completion / reasoning tokens by call kind (`classifier_llm_call_seconds{kind}`, `classifier_llm_*_tokens_total{kind}`, [`ai/classifier/API.md § Concurrency and durability`](../classifier/API.md#concurrency-and-durability)), and vLLM itself exports `vllm:num_requests_running` / `vllm:num_requests_waiting`, `vllm:kv_cache_usage_perc`, and the prefix-cache pair `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` (counters, in tokens — hit rate = `rate(hits) / rate(queries)`) on `/metrics`. If classifier throughput (`rate(classifier_llm_call_seconds_count{kind="score"})`) at 6 calls in flight is no better than at 4 while each call got slower, lower `CLASSIFIER_MAX_LLM_CALLS` again; the vLLM flag can stay at 8.
+**Expect a sublinear gain.** Doubling the batch does not double throughput here: DFlash's speedup (see below) is largest single-stream and shrinks as the batch grows, and every sequence shares the same two GPUs' compute. Measure rather than assume — the classifier records per-call latency and prompt / cached / completion / reasoning tokens by call kind (`classifier_llm_call_seconds{kind}`, `classifier_llm_*_tokens_total{kind}`, [`ai/classifier/API.md § Concurrency and durability`](../classifier/API.md#concurrency-and-durability)), and vLLM itself exports `vllm:num_requests_running` / `vllm:num_requests_waiting`, `vllm:kv_cache_usage_perc`, and the prefix-cache pair `vllm:prefix_cache_queries` / `vllm:prefix_cache_hits` (counters, in tokens — hit rate = `rate(hits) / rate(queries)`) on `/metrics`. If classifier throughput (`rate(classifier_llm_call_seconds_count{kind="score"})`) at 6 calls in flight is no better than at 4 while each call got slower, lower the `muse-glimmer` entry's `max_concurrent` in `ai/classifier/models.yaml` again (the classifier's metrics carry a `model` label); the vLLM flag can stay at 8.
 
 **`--enable-prompt-tokens-details`** (a `FrontendArgs` flag in v0.29.0, default off) makes every response's `usage` carry `prompt_tokens_details.cached_tokens` — how many prompt tokens the prefix cache served — so the classifier's per-call `cached_tokens` metric is non-zero. `--enable-prefix-caching` is what does the caching; the classifier orders its scoring prompt so the page image and its document text are a shared prefix across every criterion on a page (`ai/classifier/llm/prompts.py`). With the reasoning parser on, `usage.completion_tokens_details.reasoning_tokens` is reported without any extra flag.
 
@@ -239,15 +236,17 @@ At startup vLLM logs `Maximum concurrency for 262144 tokens per request: N`; tha
 
 **DFlash speculative decoding.** `meta-models/Muse-Glimmer-30B-assistant` is the official drafter — a 5-layer block-diffusion network that reads the target's residual stream at layers {1, 13, 25, 37, 49} and proposes a 16-token block in one forward pass; the target verifies the block in parallel, so output is bit-identical to plain decoding. Configuration is `--speculative-config '{"method":"dflash","model":"<drafter>","num_speculative_tokens":15}'` — the drafter's block size is 16, so **`num_speculative_tokens` is fixed at 15** (block minus the anchor token); it is not a tuning knob here. The drafter is distilled for this exact target checkpoint and must not be paired with a quantised or fine-tuned variant. Meta reports ~3× single-stream speedup on consumer GPUs; expect the gain to shrink as concurrency rises, which is why the recipe halves `--max-num-seqs` when DFlash is on. This service runs 8 anyway because the KV pool has the room and the classifier was queueing at 4 — the per-call latency metrics above are how to tell whether the extra slots pay for the smaller speedup. To disable speculation for A/B testing, remove the `--speculative-config` line and recreate the container. The drafter downloads into the shared `vllm_data` volume alongside the target on first start.
 
-**Parsers and sampling.** `--reasoning-parser muse_glimmer` and `--tool-call-parser muse_glimmer` must run **together** — both key off the model's channel-scoped message framing (reasoning rides special markers, tool calls are emitted as `<atem:function_calls>` blocks, not OpenAI JSON). The reasoning parser forces `skip_special_tokens=False` itself. `--generation-config auto` picks up Meta's published sampling defaults (temperature 1.0, top_p 0.95, top_k 64) from the repo's `generation_config.json`; the model card explicitly warns against greedy decoding. Reasoning depth is set by a system-prompt line `Reasoning strength: low|medium|high|xhigh`, not by a chat-template kwarg. Stock chat template — no jinja mount needed.
+**Parsers and sampling.** `--reasoning-parser muse_glimmer` and `--tool-call-parser muse_glimmer` must run **together** — both key off the model's channel-scoped message framing (reasoning rides special markers, tool calls are emitted as `<atem:function_calls>` blocks, not OpenAI JSON). The reasoning parser forces `skip_special_tokens=False` itself. `--generation-config auto` picks up Meta's published sampling defaults (temperature 1.0, top_p 0.95, top_k 64) from the repo's `generation_config.json`; the model card explicitly warns against greedy decoding. Stock chat template — no jinja mount needed. **Reasoning depth is a chat-template variable**, `reasoning_strength` (`low|medium|high|xhigh`), passed like Qwen's `reasoning_effort` — `chat_template_kwargs: {"reasoning_strength": "xhigh"}` in the request (or a LiteLLM deployment's `extra_body`). The stock template (`meta-models/Muse-Glimmer-30B/chat_template.jinja`) defaults it to **`high`** and injects `Reasoning strength: <value>.` into the system text itself — *unless* the system prompt already contains a "reasoning strength" line, which then **wins over the variable**. So every chat that sets nothing already runs at `high` (the model card: "Use high or xhigh for complex problem solving, coding, and agentic tasks"); LiteLLM's `local-code` chain sends `xhigh` ([LITELLM.md § local-code: what it adds](../litellm/LITELLM.md#local-code-what-it-adds)); and the classifier sends `chat_template_kwargs: {"reasoning_strength": "low"}` (the `muse-glimmer` entry's `reasoning` in `ai/classifier/models.yaml`), which *lowers* its calls from that default — it puts no reasoning line in its system prompts, since one would override the variable. To see what a request renders, `POST /tokenize` with the same `messages` + `chat_template_kwargs` and `"return_token_strs": true`.
 
-**Multimodal.** Text + image input, up to 4096 visual tokens per image. vLLM's default is one image per prompt; this service runs with `--limit-mm-per-prompt '{"image": 3}'` because the classifier's saved **references** (worked examples, [`ai/classifier/API.md § References`](../classifier/API.md#references)) send up to three images in one scoring call: a PASS example, a FAIL counter-example and the candidate page. Every other classifier call — and any ordinary chat — still sends one image. The classifier's `VISION_LLM_MAX_IMAGES_PER_PROMPT` (default `3`) must match this flag: set it to `2` and the classifier sends one example per call instead; set it to `1` (or drop the flag here) and the classifier refuses requests that use references at submit, rather than sending a request vLLM would reject. Raising the number costs encoder-cache memory — re-check the VRAM note above. LiteLLM registers the alias with `supports_vision: true`.
+**Multimodal.** Text + image input, up to 4096 visual tokens per image. vLLM's default is one image per prompt; this service runs with `--limit-mm-per-prompt '{"image": 3}'` because the classifier's saved **references** (worked examples, [`ai/classifier/API.md § References`](../classifier/API.md#references)) send up to three images in one scoring call: a PASS example, a FAIL counter-example and the candidate page. Every other classifier call — and any ordinary chat — still sends one image. The classifier's registry entry for this model (`max_images_per_prompt: 3` in `ai/classifier/models.yaml`) must match this flag: set it to `2` and the classifier sends one example per call instead; set it to `1` (or drop the flag here) and the classifier refuses requests whose criteria would use references on this model at submit, rather than sending a request vLLM would reject. Raising the number costs encoder-cache memory — re-check the VRAM note above. LiteLLM registers the alias with `supports_vision: true`.
 
 **GPU scheduling — mutually exclusive with `qwen3.8`.** Both services are TP=2 at 0.90 utilisation on `count: all`, so both land on the first two visible GPUs and cannot co-run. Bring up one or the other:
 
 ```bash
 make stop vllm qwen3.8 && make up vllm muse-glimmer
 ```
+
+While `qwen3.8` runs instead, `muse-glimmer`'s `/metrics` probe fails, LiteLLM's overflow hook marks it down, and the chain aliases degrade to `qwen3.8-solo` alone (then Claude, except `local-private`).
 
 To pin the NVLinked pair explicitly instead of relying on enumeration order, replace `count: all` with `device_ids: ['0', '1']` under `deploy.resources.reservations.devices`.
 

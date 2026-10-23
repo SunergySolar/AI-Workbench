@@ -14,8 +14,12 @@ POST takes the same two encodings /assess does, parsed into ONE model
 
     application/json     {"document": {"type", "data", "filename"}, "page": 0,
                           "criteria": [...], "breakdown": {...}, "regions": {...},
-                          "region_units": "px", "title", "description", "tags"}
+                          "region_units": "px", "title", "description", "tags",
+                          "model"}
                          — or "from_job" + "from_job_item" instead of a document.
+                         ``model`` (optional) is the creation job's registry
+                         model and must be a VISION model (400 otherwise), as
+                         must every criterion's own ``options.model``.
     multipart/form-data  ONE `file` part (the legacy `image` alias too), and the
                           other keys as fields — `criteria`, `breakdown`,
                           `regions` and `tags` holding JSON (`tags` may instead
@@ -29,8 +33,9 @@ request, never a creation job that fails a minute later:
   2. CLASSIFIER_REFERENCE_MAX_COUNT references already exist — 409;
   3. the source:
        ``document``  its bytes resolved like /assess (base64, inline text, an
-                     SSRF-checked URL), its kind from the bytes: a JPEG/PNG,
-                     an SVG, or a PDF with ``page`` in range; .txt / .docx are
+                     SSRF-checked URL), its kind from the bytes: a photo
+                     (JPEG/PNG/HEIC/HEIF/AVIF), an SVG, or a PDF with
+                     ``page`` in range; .txt / .docx are
                      a 400 (a reference shows the model a page image). The
                      page's pixel size is read without rendering it. An SVG's
                      external images are fetched and inlined here, as for
@@ -76,6 +81,7 @@ from pydantic import ValidationError
 from common.documents import (
     UnsupportedDocumentError,
     detect_kind,
+    ensure_image_support,
     pdf_page_count,
     pdf_page_size,
     svg_page_size,
@@ -85,8 +91,15 @@ from common.vision import content_type_for
 from analysis import load_input_bytes, resolve_svg_images, validate_content_type
 from analysis.loading import _validate_image_dimensions
 from api.assess import _json_filename
+from api.criterion_options import without_model
 from api.reference_schemas import ReferencePatch, ReferenceRequest
-from api.schemas import ClassifierMetadata, CriterionInput, check_criteria_rules, validation_message
+from api.schemas import (
+    ClassifierMetadata,
+    CriterionInput,
+    check_criteria_rules,
+    check_model_rules,
+    validation_message,
+)
 # A module, not names: SVG_FETCH_IMAGES is read at call time (see api.assess).
 import config
 from config import (
@@ -110,7 +123,7 @@ router = APIRouter(tags=["references"])
 # Multipart fields this endpoint reads. `file` / `image` is the ONE page.
 _FORM_FIELDS = {
     "file", "image", "page", "from_job", "from_job_item", "criteria", "breakdown",
-    "regions", "region_units", "title", "description", "tags",
+    "regions", "region_units", "title", "description", "tags", "model",
 }
 _JSON_FORM_FIELDS = ("criteria", "breakdown", "regions")
 _INT_FORM_FIELDS = ("page", "from_job_item")
@@ -141,6 +154,9 @@ _OPENAPI = {
                         "description": {"type": "string"},
                         "tags": {"type": "string",
                                  "description": "JSON array, or repeat the field"},
+                        "model": {"type": "string",
+                                  "description": "The creation job's model (a vision "
+                                                 "registry id, GET /models)"},
                     },
                 }
             },
@@ -256,10 +272,10 @@ async def _from_form(request: Request) -> tuple[ReferenceRequest, Optional[_Uplo
             body[key] = int(str(value))
         except ValueError:
             raise _bad(f"'{key}' must be an integer, got {str(value)[:40]!r}")
-    for key in ("from_job", "region_units", "title", "description"):
+    for key in ("from_job", "region_units", "title", "description", "model"):
         value = form.get(key)
         if value is not None:
-            body[key] = str(value)
+            body[key] = str(value).strip() if key == "model" else str(value)
     tags = [str(v) for v in form.getlist("tags")]
     if len(tags) == 1 and tags[0].lstrip().startswith("["):
         try:
@@ -278,9 +294,19 @@ async def _from_form(request: Request) -> tuple[ReferenceRequest, Optional[_Uplo
 
 def _image_size(raw: bytes) -> tuple[int, int]:
     """An image's (width, height) AFTER EXIF rotation, from its header only —
-    the same frame ``analysis.loading`` decodes it into."""
+    the same frame ``analysis.loading`` decodes it into.
+
+    The one swap serves every format: a HEIC/HEIF opens with the
+    container's rotation already in its size and the EXIF tag reset to 1
+    (pillow-heif), while an AVIF opens at its stored size with that rotation
+    reported AS the EXIF tag (Pillow). ``unit-tests/classifier/
+    test_image_formats.py`` pins both against the decoder."""
     from PIL import Image
 
+    try:
+        ensure_image_support(raw)
+    except UnsupportedDocumentError as exc:
+        raise _bad(f"Could not read the image: {exc}")
     try:
         with Image.open(io.BytesIO(raw)) as img:
             width, height = img.size
@@ -300,8 +326,8 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
     if kind not in ("image", "pdf", "svg"):
         raise _bad(
             f"document {upload.filename!r} is {kind}, which has no page image; a reference "
-            "is one JPEG/PNG, one SVG, or one PDF page — the example is shown to the "
-            "vision model"
+            "is one JPEG/PNG/HEIC/HEIF/AVIF photo, one SVG, or one PDF page — the example "
+            "is shown to the vision model"
         )
     page = model.page or 0
     pages = 1
@@ -336,8 +362,12 @@ def _resolve_document(model: ReferenceRequest, upload: _Upload) -> _Source:
 def _same_question(a: CriterionInput, b: CriterionInput) -> bool:
     """Whether a job's answer to ``b`` answers ``a`` — same type, same
     ``score``, same resolved options. Weight and depends_on change how an
-    answer counts, not what it is."""
-    return a.type == b.type and a.score == b.score and a.resolved_options() == b.resolved_options()
+    answer counts, not what it is; ``options.model`` changes who answered,
+    not the question (``without_model``)."""
+    return (
+        a.type == b.type and a.score == b.score
+        and without_model(a.resolved_options()) == without_model(b.resolved_options())
+    )
 
 
 def _legacy_criteria(job_id: str, result: dict) -> tuple[list[CriterionInput], str]:
@@ -561,6 +591,12 @@ async def create_reference(request: Request):
             src.raw, src.document_warnings = await resolve_svg_images(src.raw)
     else:
         src = await _resolve_from_job(model)
+        if model.criteria is None:
+            # The job's own criteria: their options.model must see images too.
+            try:
+                check_model_rules(src.criteria, model.model, require_vision=True)
+            except ValueError as exc:
+                raise _bad(f"Invalid reference: the job's criteria: {exc}")
     _caller_answers(model, src)
 
     reference_id = new_reference_id()
@@ -592,6 +628,7 @@ async def create_reference(request: Request):
         supplied=src.supplied,
         source=src.source,
         warnings=src.warnings,
+        model=model.model,
     )
     try:
         depth = await queue.enqueue(job_id, payload)

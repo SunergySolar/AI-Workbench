@@ -2,12 +2,14 @@
 
     POST /references
       ReferenceRequest
-        ├── document + page        one page: a JPEG/PNG, or page `page` of a PDF
+        ├── document + page        one page: a photo (JPEG/PNG/HEIC/HEIF/AVIF), an
+        │                          SVG, or page `page` of a PDF
         │   (or from_job + from_job_item — a completed /assess job's item)
         ├── criteria   : list[CriterionInput]   — the same model /assess uses
         ├── breakdown  : {name: BreakdownInput} — the answer key, per criterion
         ├── regions    : {name: [RegionInput]}  — where; [] = the whole page
         ├── region_units : "px" | "grid"
+        ├── model      : the creation job's registry model (vision only)
         └── title, description, tags
 
     PATCH /references/{id}
@@ -34,7 +36,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from api.schemas import CriterionInput, DocumentInput, check_criteria_rules
+from api.criterion_options import check_model_id
+from api.schemas import CriterionInput, DocumentInput, check_criteria_rules, check_model_rules
 from config import (
     LLM_BBOX_GRID,
     REFERENCE_DESCRIPTION_MAX_CHARS,
@@ -171,7 +174,9 @@ class ReferenceRequest(_Meta):
     """The whole POST /references body — JSON and multipart both land here."""
 
     document: Optional[DocumentInput] = Field(
-        default=None, description="The example: a JPEG/PNG, or a PDF (one page of it)."
+        default=None,
+        description="The example: a JPEG/PNG/HEIC/HEIF/AVIF photo, an SVG, or a PDF "
+                    "(one page of it).",
     )
     page: Optional[int] = Field(
         default=None, ge=0, description="Which PDF page (0-based). Default 0; 0 for an image."
@@ -202,6 +207,19 @@ class ReferenceRequest(_Meta):
         description="'px': original page pixels. 'grid': 0-1000 on both axes "
                     "(recommended for a PDF page, whose pixel size depends on the render DPI).",
     )
+    model: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="The creation job's model — a registry id from GET /models, and a "
+                    "VISION model: it scores, locates and describes the page. Omitted: "
+                    "the registry default. A criterion's options.model still wins for it.",
+    )
+
+    @field_validator("model")
+    @classmethod
+    def _known_model(cls, value: Optional[str]) -> Optional[str]:
+        return check_model_id(value)
 
     @model_validator(mode="after")
     def _shape(self) -> "ReferenceRequest":
@@ -226,6 +244,11 @@ class ReferenceRequest(_Meta):
                     "not guided by other references; drop it"
                 )
             self.check_keys([c.name for c in self.criteria], {c.name: c for c in self.criteria})
+        # Every model the creation job uses must see images: the job model,
+        # and each criterion's own options.model. (A from_job reference's
+        # criteria are only known once the job is read; api.references
+        # checks them then.)
+        check_model_rules(self.criteria or [], self.model, require_vision=True)
         if self.region_units == "grid":
             for name, regions in self.regions.items():
                 for region in regions:

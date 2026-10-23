@@ -48,6 +48,7 @@ from analysis.outcome import Outcome, skipped
 from api.schemas import CriterionInput
 from common.vision import Region
 from llm import client as llm_client
+from llm.models import get_registry
 
 HERE = pathlib.Path(__file__).resolve().parent
 DOCS = HERE / "documents"
@@ -573,7 +574,7 @@ def test_one_failed_unit_fails_alone_and_the_job_is_incomplete(monkeypatch):
 def test_the_unit_cap_bounds_a_job(monkeypatch):
     fake = Model(delay=0.05)
     monkeypatch.setattr(llm_client, "_send", fake)
-    monkeypatch.setattr(llm_client.LLM_CALLS, "limit", 16)
+    monkeypatch.setattr(get_registry().default.limit, "limit", 16)
     criteria = [CriterionInput(name=f"c{i}", type="llm") for i in range(2)]
     monkeypatch.setattr(scheduler, "MAX_UNITS_PER_JOB", 2)
     _analyze(_txt_docs("a", "b", "c"), criteria)
@@ -718,6 +719,19 @@ def test_document_kinds_reports_items_and_units(client):
     pdf = next(k for k in body["kinds"] if k["kind"] == "pdf")
     assert pdf["pages"].startswith("any — every page is one item")
     assert body["regions"]["artifact_max_bytes_per_item"] > 0
+    # A photo is one item whatever its format — HEIC / HEIF / AVIF included —
+    # and `formats` is the live answer for this process's decoders.
+    from common.documents import available_image_formats
+
+    image = next(k for k in body["kinds"] if k["kind"] == "image")
+    assert image["pages"] == "1 — one item"
+    assert image["extensions"] == [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"]
+    assert image["content_types"] == [
+        "image/jpeg", "image/png", "image/heic", "image/heif", "image/avif"
+    ]
+    assert image["formats"] == available_image_formats()
+    assert image["formats"][:2] == ["jpeg", "png"]
+    assert "video" in {u["kind"] for u in body["unsupported"]}
 
 
 # ---------------------------------------------------------------------------

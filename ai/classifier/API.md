@@ -1,19 +1,151 @@
 # Classifier API
 
-FastAPI service that assesses **documents** — JPEG/PNG photos, PDFs of any
+FastAPI service that assesses **documents** — JPEG/PNG/HEIC/HEIF/AVIF photos
+(an iPhone's HEIC as it comes), PDFs of any
 page count (native or scanned), SVG drawings, plain text, and .docx, several
 per request — against a list of criteria, each answered by an OpenCV detector,
 deterministic text matching, the open-vocabulary detector, or the vision LLM.
 Every page of every document is one **item**; each criterion runs once per item and its
 per-item results are aggregated into one answer (see
-[§ Documents, pages and items](#documents-pages-and-items)). The LLM is Meta's
-Muse-Glimmer-30B served by the `muse-glimmer` vLLM container (`VISION_LLM_API`
-/ `VISION_LLM_MODEL` / `VISION_LLM_MAX_TOKENS` in the `## Classifier` block of
-`.env`); see [VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
-Muse Glimmer's reasoning depth is set per call from `VISION_LLM_REASONING_STRENGTH`
-(default `low`, driven by `CLASSIFIER_REASONING_STRENGTH` in `.env`); its thinking
-is stripped server-side by the `muse_glimmer` reasoning parser, so only the JSON
-answer reaches the classifier.
+[§ Documents, pages and items](#documents-pages-and-items)). Which model
+answers is chosen from a checked-in **model registry**,
+[`models.yaml`](models.yaml) (`GET /models`; see [§ Models](#models)): per
+request (`model`) and per criterion (`options.model`). The default is Meta's
+Muse-Glimmer-30B served by the `muse-glimmer` vLLM container; see
+[VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding).
+Its reasoning depth rides in every request body as
+`chat_template_kwargs: {"reasoning_strength": "low"}` (the registry entry's
+`reasoning`) — the stock chat template renders "Reasoning strength: low." into
+the system text itself, so the classifier sends no reasoning line; its
+thinking is stripped server-side by the `muse_glimmer` reasoning parser, so
+only the JSON answer reaches the classifier.
+
+---
+
+## Models
+
+Every model call — scoring, the box loop's ask / refine / verify, the
+`references: "auto"` selection, a reference's description — goes to one
+entry of [`ai/classifier/models.yaml`](models.yaml), validated at startup by
+`llm/models.py`. An entry is any OpenAI-compatible chat-completions endpoint:
+a local service on `ai_shared` with no key, or an `https://` provider with an
+API key. **Keys never live in the YAML**: an entry names an environment
+variable (`api_key_env`), which must also be listed in the classifier
+compose `environment:` as `- VAR=${VAR:-}`.
+
+**Which model a call uses** — the first that is set:
+
+1. the criterion's `options.model` (`llm` criteria, and a `cv` criterion
+   answered by its llm fallback — on a `cv` name an OpenCV detector or the
+   detector service answers it is a 400);
+2. the request's `model` (`POST /assess`, JSON or a multipart `model` field);
+3. the registry's `default` (`muse-glimmer`).
+
+The `auto` selection call always uses the request's model (2, then 3): it
+serves every criterion on the item. `POST /references` takes the same
+top-level `model` for its creation job (scoring, box loop, description).
+Nothing ever picks an external model on its own; an external entry sends
+document pages and text to that provider, and `GET /models` reports each
+entry's host so a caller can see where the data goes.
+
+**What an entry sets** (every field is validated; an unknown key, invalid
+YAML, an unknown `default`, an `api_key_env` on plain `http://` to a dotted
+host, a reasoning key set twice, a `system_line` reasoning on Muse Glimmer,
+or an unavailable default stops the container at startup with the reason in
+its log):
+
+| Field | Meaning |
+|---|---|
+| `description` | What it is — served by `GET /models` |
+| `url` | Full chat-completions URL, `http://` or `https://` |
+| `served_name` | The request body's `model` |
+| `api_key_env` / `api_key_header` | The NAME of the env var holding the key (`null` = no auth); `Authorization` sends `Bearer <key>`, any other header the raw key. Unset or empty → the entry is `available: false` and selecting it is a 400 |
+| `vision` | `false` = text-only (below) |
+| `max_images_per_prompt` | Must match the server's `--limit-mm-per-prompt`: 3 = contrastive references, 2 = one example per call, 1 = no references; 0 for a text-only model |
+| `reasoning` | `{style: chat_template_kwargs, key, value}` → `chat_template_kwargs: {key: value}` in the body (Muse Glimmer: `reasoning_strength`; the qwen family: `reasoning_effort`); `{style: system_line, value}` → that line appended to every system prompt, for a model whose template has no variable (refused on Muse Glimmer, where a system line overrides the variable); `{style: none}` |
+| `extra_body` | Merged into every body (sampling, other `chat_template_kwargs`); may not set `model`, `messages`, the token field, `response_format` or the reasoning key |
+| `json_mode` / `token_param` | `response_format: json_object`; `max_tokens` or `max_completion_tokens` |
+| `max_tokens` | Completion budget per call kind: `score`, `box` (each ask / refine / verify), `select`, `describe` — reasoning tokens count against it |
+| `timeout_s` | Seconds ONE request may take. Not streamed, so it bounds queue + prefill + reasoning + answer; a timeout is not retried |
+| `max_concurrent` | Requests to THIS model in flight across every job — its own limit, held around the HTTP request in `llm/client.py` |
+| `text_char_budget` | Characters of the text layer pasted into a scoring prompt |
+
+The checked-in entries: **`muse-glimmer`** (the default — 3 images,
+`reasoning_strength: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 6 in
+flight of its 8 sequences so 2 stay free for the LiteLLM chat chains, 60 000
+characters), **`qwen2.5-vl`** (the `vllm-qwen-vl` service, the old manual
+fallback: 1 image so no references, no reasoning, budgets sized for its
+8192-token context), **`qwen3.5-4b`** (the CPU-only `qwen3.5-4b` llama.cpp
+service in [`ai/llama`](../llama/LLAMA.md#qwen35-4b--a-small-cpu-model-for-route-policy):
+text only, thinking off through `extra_body.chat_template_kwargs:
+{enable_thinking: false}`, a 512-token score budget = the server's
+`--n-predict`, 90 s, 2 in flight = its `--parallel 2`, 12 000 characters — the
+model route-policy's `llm_classifier` evaluator sends conversation transcripts
+to, one `text` document and one presence criterion per route; seconds per
+call, so not a document model) and **`qwen3.8-solo`** (the `qwen3.8-solo` vLLM
+service, order 1 of three LiteLLM chat chains: text only,
+`reasoning_effort: low`, budgets 8192 / 1024 / 2048 / 1024, 240 s, 60 000
+characters, and **1** in flight of its 3 sequences, because a queued
+classifier call makes the overflow hook spill chat off it — a benchmark
+candidate for the same evaluator). Check what a Muse request renders on the box:
+
+```bash
+curl -s muse-glimmer:8000/tokenize -H 'content-type: application/json' \
+  -d '{"model":"muse-glimmer","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"reasoning_strength":"low"},"return_token_strs":true}'
+# the system text contains "Reasoning strength: low."
+```
+
+Editing `models.yaml` on the box takes effect with `docker restart
+classifier` (it is bind-mounted read-only over `/app/ai/classifier/models.yaml`;
+compose cannot see the edit, so it is a recreate-class change, not a swap). It
+is also baked into the image — the build's import check loads it, so an
+invalid registry fails `make build classifier`.
+
+More on the checked-in entries:
+
+- **`muse-glimmer`'s `max_concurrent: 6`** is 6 of its `--max-num-seqs 8`
+  because `muse-glimmer` is also in LiteLLM's chain aliases and the overflow
+  hook spills chat (eventually to Claude) once vLLM's waiting queue stays
+  non-empty. Watch `classifier_llm_call_seconds{kind, model}` before raising it.
+- **`qwen3.5-4b`** uses `reasoning: {style: none}` plus
+  `extra_body.chat_template_kwargs.enable_thinking: false`, because
+  `reasoning.value` is a string (it cannot carry the boolean); it sets
+  `json_mode`, and `timeout_s: 90`. It is route-policy's classifier — one
+  `text` document per job, never a document model — and route-policy's
+  `history.max_chars` (ruleset config) must stay at or under its
+  `text_char_budget` (12 000). Its `max_concurrent: 2` and score budget 512
+  change together with the llama.cpp service's `--parallel 2` /
+  `--n-predict 512` / `-c 32768`.
+- **`qwen3.8-solo`** is a benchmark candidate for that classifier at
+  `max_concurrent: 1`, so it never takes more than one of the 3 sequences chat
+  runs on (a queued request there makes the overflow hook spill chat).
+
+**Text-only models** (`vision: false`) score from the page's text layer
+alone: the scoring prompt carries no image and says so ("You are assessing
+the text of a single document page…"; a criterion about how the page looks
+is answered "uncertain"), and `detail.image_sent` is false. Refused at submit
+(400) for such a model: `options.boxes`; a request with `references` on a
+criterion that uses them (also any model with `max_images_per_prompt` < 2);
+a `cv` criterion whose llm fallback would land on it; `references: "auto"`
+with it as the job model; a photo while OCR is off (`CLASSIFIER_OCR_ENGINE=none`)
+or the criterion's `options.ocr` is `never`; and any `POST /references`
+(a reference is an image example). A page that turns out to have no text at
+run time fails that unit (`status: "error"`, "no text available for a
+text-only model").
+
+**Recording.** Each result's `detail.model` names the registry id that
+answered; `request.model` in the result is the job's model, resolved. Every
+`llm_calls` row carries `model_id` and the URL actually posted to
+(`api_url`); the usage views group `by_model` and `GET /usage` filters by
+`model` (see [§ Model usage](#model-usage)). The `classifier_llm_*` metrics
+carry a `model` label (registry ids only).
+
+**Replaced settings, removed with no fallback**: `VISION_LLM_API`,
+`VISION_LLM_MODEL`, `CLASSIFIER_REASONING_STRENGTH`, `VISION_LLM_MAX_TOKENS`,
+`VISION_LLM_MAX_IMAGES_PER_PROMPT`, `CLASSIFIER_MAX_LLM_CALLS`,
+`CLASSIFIER_HTTP_TIMEOUT_S`, `CLASSIFIER_LLM_BBOX_MAX_TOKENS`,
+`CLASSIFIER_REFERENCE_SELECT_MAX_TOKENS`, `CLASSIFIER_TEXT_CHAR_BUDGET`.
+Startup logs one WARNING naming any still set.
 
 Base URL (direct): `http://<host>:8005` — `PORT_CLASSIFIER`, published by the
 [`ai/edge`](../edge/EDGE.md) HAProxy (limited to `EDGE_ALLOWED_CIDRS`). The
@@ -40,6 +172,7 @@ One level of subpackages, imported by bare name — the container sets
 ai/classifier/
   main.py              FastAPI app, lifespan, router registration — nothing else
   config.py            every constant and env knob in the service, one file
+  models.yaml          the model registry: every model a job or criterion may select (GET /models)
   db.py                the one asyncpg pool on classifier-db, shared by the three stores
   logger.py            the one "classifier" logger every module imports
   middleware.py        correlation IDs: the ContextVar, the filter, the middleware
@@ -50,7 +183,7 @@ ai/classifier/
     criterion_options.py  LLMOptions / TextOptions / CVOptions / DetectorOptions: defaults, caps,
                        options.aggregate and its defaults table; ReferenceOptions (options.reference)
     assess.py          POST /assess — JSON or multipart, one model, the submit-time checks and the item cap
-    introspection.py   GET /criterion-types, /hints, /cv-detectors, /document-kinds, /health
+    introspection.py   GET /models, /criterion-types, /hints, /cv-detectors, /document-kinds, /health
     artifacts.py       the four /jobs/{id}/artifacts routes and the lazy layer renderer
     reference_schemas.py  ReferenceRequest / ReferencePatch — POST and PATCH /references
     references.py      the /references routes: save a worked example (a "reference" job
@@ -94,9 +227,11 @@ ai/classifier/
     finalize.py        caller answers + pipeline answers → the frozen record
     render.py          page.jpg / working.jpg / c.<slug>.jpg, and the `auto` catalogue
   llm/
+    models.py          the registry: models.yaml validated into ModelSpecs (endpoint, key,
+                       budgets, reasoning, timeout, a concurrency limit each), get_registry
     prompts.py         the single-criterion scoring prompt (with reference examples), the
                        loop's two small ones, the reference describe and selection prompts
-    client.py          LLM_CALLS (the process-wide limit), call_vllm, call_vllm_json, the encoder
+    client.py          per-model routing + limit (_post), call_model, call_model_json, the encoder
     usage.py           UsageStore (`llm_calls` in classifier-db): one row per model request,
                        attributed to its job / criterion / item through context vars
     validate.py        find the answer, clamp it, derive the verdict from the score
@@ -166,17 +301,34 @@ on `ai_shared`, host port `PORT_CLASSIFIER_DB` = 5439): the job queue
 (`jobs`, `common.jobs.postgres.PostgresRegistry`), each job's progress
 history (`job_progress`, see [§ Progress](#progress)), saved references
 (`reference_examples`) and one row per model request (`llm_calls`). The
-stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT +
-CLASSIFIER_MAX_LLM_CALLS + 8` connections). The database is the only store:
+stores share one asyncpg pool (`db.py`, `CLASSIFIER_MAX_CONCURRENT` + every
+model's `max_concurrent` + `DB_POOL_HEADROOM` (8, a `config.py` constant)
+connections — `db.pool_max()`; adding registry entries grows it, e.g. the
+`qwen3.5-4b` and `qwen3.8-solo` entries took Σ `max_concurrent` from 8 to 11
+and the pool by 3). The database is the only store:
 with `CLASSIFIER_DB_HOST` unset, or the database unreachable, the service
-refuses to start and says why. The same database is federated into Trino as
+refuses to start and says why. `CLASSIFIER_DB_HOST` (`classifier-db`) and the
+port are fixed in the compose file, never in `.env`; the credentials are
+`CLASSIFIER_DB_USER` / `_PASSWORD` / `_NAME` (all `classifier` — dev defaults,
+override the password before exposing `PORT_CLASSIFIER_DB` past the host), and
+the DSN is built with `urllib.parse.quote` on user and password, so any
+character is safe in them. Files live under `CLASSIFIER_DATA_DIR` (`/data`,
+fixed in the compose file) on the `classifier_data` volume. The same database is federated into Trino as
 the `postgres_classifier` catalog (read-only `trino_reader` role), so jobs,
 references and per-call cost can be queried from Trino and Superset. That
 role is created by `ai/classifier/db-init/10-trino-reader.sh` on the first
 start of an empty `classifier_db` volume, with
 `CLASSIFIER_TRINO_READER_PASSWORD` from `.env` (`openssl rand -hex 32`; empty
-skips it) — re-run the script by hand for an existing volume or to rotate the
-password. Files
+skips it with a log line, and only the Trino catalog breaks) — re-run the
+script by hand for an existing volume or to rotate the password: edit `.env`,
+`make up classifier` (so `classifier-db`'s env has it), `docker exec
+classifier-db sh /docker-entrypoint-initdb.d/10-trino-reader.sh`, then `make
+up trino` (the coordinator's env). The role is `pg_read_all_data` +
+`default_transaction_read_only`, with no `BYPASSRLS` (nothing here uses RLS);
+it reads every job result and reference, so treat its password as a real
+secret. The script is a `.sh` that must stay safe to SOURCE — the postgres
+entrypoint sources an init script that has no exec bit — so no `exit` and no
+`set`. Files
 stay on the `classifier_data` volume: queued payloads, artifact directories
 and reference files. A job's `result` column is `JSON`, not `JSONB` — JSONB
 sorts object keys, and `per_criterion_scores` lists criteria in request order.
@@ -186,13 +338,13 @@ item)** — one criterion on one page of one document in, one result out (a
 `text` criterion with `options.scope: "document"` is one unit per document) —
 so there are four limits, the last two process-wide (`common.jobs.limits.ConcurrencyLimit`, an
 `asyncio.Semaphore` that is safe across event loops, since every worker runs
-in the one process):
+in the one process) — and the model-call one is per MODEL:
 
 | Knob | Bounds | Default |
 |---|---|---|
 | `CLASSIFIER_MAX_CONCURRENT` | jobs at once — worker tasks each atomically claiming the oldest `pending` row | 4 |
-| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to `CLASSIFIER_MAX_LLM_CALLS` so a lone job can fill every model slot the classifier has | 6 |
-| `CLASSIFIER_MAX_LLM_CALLS` | vision-model requests in flight across ALL jobs, every call type — scoring, box ask, refine, verify. Acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | 6 |
+| `CLASSIFIER_MAX_UNITS_PER_JOB` | units ONE job evaluates at once — ten criteria on twenty pages is 200 units, this many in flight. A unit waiting on its `depends_on` does not hold a slot. Matched to the default model's `max_concurrent` so a lone job can fill every slot of that model. A slot is held for a whole unit, so a slow model's units can occupy a job's slots while its other units wait | 6 |
+| `max_concurrent` (per model, [`models.yaml`](models.yaml)) | requests to THAT model in flight across ALL jobs, every call type — scoring, box ask, refine, verify, select, describe. Each model has its own limit, acquired in `llm/client.py` around the HTTP request itself, so no call path gets around it and a slow model never takes another's slots; a retry takes a fresh slot. Size it to the model: `muse-glimmer` schedules 8 sequences (`--max-num-seqs 8`) and the classifier takes 6, leaving 2 for the LiteLLM chat chains that also use it — their overflow hook spills chat to the next order (eventually Claude) once vLLM's waiting queue stays non-empty, so filling all 8 here would push chat off the local model | muse-glimmer: 6 |
 | `CLASSIFIER_OCR_WORKERS` | OCR passes at once (one ONNX inference each, in a worker thread) | 4 |
 
 Phases: `staging` → `pending` → `processing` → `completed` | `failed`.
@@ -211,37 +363,38 @@ terminal job's artifact directory **and its row** past the TTL, on startup and
 every `CLASSIFIER_ARTIFACT_SWEEP_INTERVAL_S`. A job still `pending` or
 `processing` is never swept, however old.
 
-**The vLLM request timeout.** `CLASSIFIER_HTTP_TIMEOUT_S` (default 240) bounds
-ONE model request. Responses are not streamed, so it covers the whole
+**The model request timeout.** Each model's `timeout_s` (muse-glimmer: 240)
+bounds ONE request to it. Responses are not streamed, so it covers the whole
 generation — any wait in vLLM's own queue, prefill, all reasoning tokens and
 the JSON answer — and a timeout is an HTTP error, which is **not** retried: it
 fails that criterion (`status: "error"`), or that box-loop attempt. The wait
-for a `CLASSIFIER_MAX_LLM_CALLS` slot happens before the request and is not
-counted. Raise it if `classifier_llm_call_seconds{outcome="error"}` shows calls
-dying at the limit; lowering `CLASSIFIER_MAX_LLM_CALLS` shortens each call
-instead. Fetching a `type: "url"` document has its own fixed 120 s timeout.
+for the model's `max_concurrent` slot happens before the request and is not
+counted. Raise it if `classifier_llm_call_seconds{outcome="error", model=…}`
+shows calls dying at the limit; lowering that model's `max_concurrent`
+shortens each call instead. Fetching a `type: "url"` document has its own fixed 120 s timeout.
 
 Metrics: `classifier_job_queue_depth` (rows in `pending`),
-`classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total`
+`classifier_jobs_in_flight` (rows being processed), `classifier_llm_calls_total{status, model}`
 and `classifier_llm_latency_seconds` (every successful model request,
-unlabelled), plus a per-request breakdown by call **kind** — `score` (a
+unlabelled on purpose), plus a per-request breakdown by call **kind** and
+**model** (the registry id, a fixed set from `models.yaml`) — `score` (a
 scoring call, reference-guided ones included), `ask` / `refine` / `verify`
 (the box loop), `select` (`references: "auto"`), `describe` (a reference's
 description), `other`:
 
 | Metric | What |
 |---|---|
-| `classifier_llm_call_seconds{kind, outcome}` | histogram of each HTTP request's duration (`outcome`: `ok` \| `error`); a parse retry is a second observation |
-| `classifier_llm_prompt_tokens_total{kind}` | `usage.prompt_tokens` |
-| `classifier_llm_cached_prompt_tokens_total{kind}` | `usage.prompt_tokens_details.cached_tokens` — prompt tokens vLLM's prefix cache served. Zero unless `muse-glimmer` runs `--enable-prompt-tokens-details` |
-| `classifier_llm_completion_tokens_total{kind}` | `usage.completion_tokens` (reasoning included) |
-| `classifier_llm_reasoning_tokens_total{kind}` | `usage.completion_tokens_details.reasoning_tokens` (reported because the server runs a reasoning parser) |
+| `classifier_llm_call_seconds{kind, outcome, model}` | histogram of each HTTP request's duration (`outcome`: `ok` \| `error`); a parse retry is a second observation |
+| `classifier_llm_prompt_tokens_total{kind, model}` | `usage.prompt_tokens` |
+| `classifier_llm_cached_prompt_tokens_total{kind, model}` | `usage.prompt_tokens_details.cached_tokens` — prompt tokens vLLM's prefix cache served. Zero unless `muse-glimmer` runs `--enable-prompt-tokens-details` |
+| `classifier_llm_completion_tokens_total{kind, model}` | `usage.completion_tokens` (reasoning included) |
+| `classifier_llm_reasoning_tokens_total{kind, model}` | `usage.completion_tokens_details.reasoning_tokens` (reported because the server runs a reasoning parser) |
 
 The kind is derived from the label each call site already passes (`score/…`,
 `bbox/…`, `refine/…`, `verify/…`, `reference/select…`,
 `reference/describe`), never from a criterion name, so the label set stays
 small. Every request also writes one INFO log line — `llm call job=<id>
-kind=score label=score/<name> attempt=1 12.34s prompt=… cached=… completion=…
+model=muse-glimmer kind=score label=score/<name> attempt=1 12.34s prompt=… cached=… completion=…
 reasoning=…` — so one slow job can be read call by call, and one row in the
 `llm_calls` table, which outlives the log (see [§ Model usage](#model-usage)). Prefill vs reasoning vs retries:
 `rate(classifier_llm_cached_prompt_tokens_total) /
@@ -340,15 +493,28 @@ without the flag rejects every one of them (each guided unit then errors).
 `Maximum concurrency` — if either, drop `--gpu-memory-utilization` to `0.85`
 ([VLLM.md § Muse Glimmer 30B](../vllm/VLLM.md#muse-glimmer-30b--tensor-parallel--dflash-speculative-decoding))
 — and send one three-image chat completion to it directly. Only then recreate
-the classifier. **`VISION_LLM_MAX_IMAGES_PER_PROMPT` must match the flag**: 3
-with `{"image": 3}`; 2 sends one example per call; 1 (or a vLLM without the
-flag) disables references — `/assess` refuses them at submit. The LiteLLM
+the classifier. **The `muse-glimmer` entry's `max_images_per_prompt` in
+`models.yaml` must match the flag**: 3 with `{"image": 3}`; 2 sends one example
+per call; 1 (or a vLLM without the flag) disables references on that model —
+`/assess` refuses them at submit. The LiteLLM
 pass-through needs `PATCH` for `PATCH /references/{id}` (`make up litellm`).
 The new tables and directories are created at startup; nothing to migrate.
 
+**The model registry (`models.yaml`).** This version replaces the
+`VISION_LLM_*` / `CLASSIFIER_MAX_LLM_CALLS` / `CLASSIFIER_HTTP_TIMEOUT_S` /
+`CLASSIFIER_REASONING_STRENGTH` / … env vars with
+[`models.yaml`](models.yaml) (see [§ Models](#models)) — remove them from the
+box's `.env` (startup warns while any is set; none is read). `make build
+classifier && make up classifier` (the compose file gains the read-only
+bind mount), then check `GET /models`. Muse Glimmer's reasoning now rides as
+`chat_template_kwargs` instead of a system-prompt line; same `low` depth. The
+`llm_calls` table gains `model_id` at startup (`ALTER TABLE … ADD COLUMN IF
+NOT EXISTS`); older rows keep `NULL` there. A payload queued by the previous
+container runs unchanged on the default model.
+
 **Concurrency 4 → 6: recreate `muse-glimmer` before the classifier.** The
-classifier's `CLASSIFIER_MAX_LLM_CALLS` / `CLASSIFIER_MAX_UNITS_PER_JOB`
-defaults are now 6, sized for `muse-glimmer` running `--max-num-seqs 8` (and
+classifier's `muse-glimmer` `max_concurrent` (models.yaml) /
+`CLASSIFIER_MAX_UNITS_PER_JOB` defaults are now 6, sized for `muse-glimmer` running `--max-num-seqs 8` (and
 `--enable-prompt-tokens-details`, which fills the cached-token metric). A
 classifier sending 6 calls at a vLLM still admitting 4 keeps vLLM's waiting
 queue non-empty, which makes LiteLLM's overflow hook spill chat traffic off
@@ -382,7 +548,7 @@ those they need, so the same criteria list works across kinds.
 
 | Kind | Extensions | Detected by | Page image | Native text |
 |---|---|---|---|---|
-| `image` | `.jpg` `.jpeg` `.png` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A` | yes (EXIF-rotated) | no — needs OCR |
+| `image` | `.jpg` `.jpeg` `.png` `.heic` `.heif` `.avif` | magic bytes `FF D8 FF` / `89 50 4E 47 0D 0A 1A 0A`; HEIC / HEIF / AVIF by the brands of the leading ISO-BMFF `ftyp` box ([below](#heic--heif--avif)) | yes (rotated upright once) | no — needs OCR |
 | `pdf` | `.pdf` | `%PDF-` in the first 1 KB | yes, every page rendered at `CLASSIFIER_PDF_RENDER_DPI` (150) | yes when the PDF is digital; a scan has none |
 | `svg` | `.svg` | UTF-8 XML whose first element is `<svg>` / `<prefix:svg>` (after any XML declaration, comments, DOCTYPE) — checked **before** `txt` | yes, rendered by MuPDF at `CLASSIFIER_PDF_RENDER_DPI`, scaled down to at most 25 000 000 pixels | yes — its `<text>` elements (never its markup) |
 | `txt` | `.txt` | decodes as UTF-8 (BOM ok), no NUL bytes, mostly printable | **no** | yes |
@@ -391,15 +557,49 @@ those they need, so the same criteria list works across kinds.
 **Detection is by content, never by filename or `Content-Type`.** A PDF
 uploaded as `image/png` still loads as a PDF. The declared content type of a
 multipart part is only used for an early allowlist reject (`image/jpeg`,
-`image/png`, `image/svg+xml`, `application/pdf`, `text/plain`, the .docx type,
+`image/png`, `image/heic`, `image/heif`, `image/avif`, `image/svg+xml`,
+`application/pdf`, `text/plain`, the .docx type,
 `application/octet-stream`, and `application/msword` — the last one only so a
 legacy `.doc` reaches the magic-byte check and gets its specific "convert to
 .docx" 400). The kind is detected on the `POST /assess` request itself, per
 document, so an unsupported file is a 400 at submit time (naming the document,
-`document #1 old.doc: …`) and never becomes a job.
+`document #1 old.doc: …`) and never becomes a job. Three near-misses get a
+message of their own: a legacy `.doc` (convert to .docx), gzip / `.svgz`
+(decompress to .svg), and a video — an MP4 or MOV, such as the `.MOV` half of
+an iPhone Live Photo — which is told to send the still photo instead.
 
 `GET /document-kinds` returns this table live from a running container, plus
-the OCR engine's actual availability.
+the OCR engine's actual availability and, under the image kind's `formats`,
+which image formats this container can decode.
+
+### HEIC / HEIF / AVIF
+
+An iPhone saves photos as HEIC; they are accepted wherever a JPEG is
+(`/assess`, `/references`), as the same one-item `image` kind:
+
+* **Detection** reads the brands of the file's leading ISO-BMFF `ftyp` box
+  (`common.documents.image_format`): a HEIC brand (`heic`, `heix`, `hevc`, …)
+  anywhere wins — a Samsung photo is major `mif1` with compatible `heic` —
+  then an AVIF brand (`avif`, `avis`), then a generic HEIF one (`mif1`,
+  `msf1`). An `ftyp` with none of them is a video, refused as above.
+  `documents[].document_info.content_type` is `image/heic`, `image/heif` or
+  `image/avif` accordingly.
+* **Decoding**: HEIC/HEIF through
+  [pillow-heif](https://pillow-heif.readthedocs.io/), AVIF through Pillow's
+  own plugin (≥ 11.3). Both are checked when the image is built
+  (`available_image_formats()`), so a container that cannot decode them
+  fails its build, not its first photo.
+* **Primary image only.** Burst frames, depth maps, thumbnails and HDR gain
+  maps are ignored, and a 10/12-bit image is reduced to 8-bit.
+* **Orientation is applied once.** A HEIF says how to turn its pixels in the
+  container (`irot` / `imir`) and an iPhone writes the EXIF orientation tag
+  too; the decoder applies the container's rotation and mirroring exactly
+  once, so the page — and `p{n}.base.jpg`, and every region — is upright.
+* Everything downstream sees a decoded array, re-encoded as JPEG / PNG (the
+  vision prompt, `p{n}.base.jpg`, reference images, detector requests), so
+  nothing after the decode knows the upload was a HEIC. The one exception
+  is the [SVG image inliner](#external-references-in-svg), which forwards
+  original bytes and so still takes PNG or JPEG only.
 
 ### Limitations
 
@@ -457,13 +657,15 @@ network for its input:
 | Bound | Knob (default) |
 |---|---|
 | Distinct URLs fetched per SVG; the rest are blanked with an `over the 10-image limit` warning | `CLASSIFIER_SVG_FETCH_MAX_IMAGES` (10) |
-| Bytes per image; a bigger body is abandoned mid-download | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
-| Seconds per image, start to finish (every SVG's images in a request are fetched concurrently) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
+| Bytes per image; streamed, a bigger body is abandoned mid-download (or refused up front when `Content-Length` says so) | `CLASSIFIER_SVG_FETCH_MAX_BYTES` (5 000 000) |
+| Seconds per image, start to finish — a wall-clock deadline, so a server dripping a byte a second still trips it (every SVG's images in a request are fetched concurrently, so this is also roughly the latency they add to a submit) | `CLASSIFIER_SVG_FETCH_TIMEOUT_S` (10) |
 
 Every URL goes through `common.net.fetch_url`: the same SSRF blocklist as a
 `type: "url"` document, http(s) only, **no redirects** (a 3xx could point past
 the check), and the body must be a PNG or JPEG by its bytes — not a nested SVG,
-not an HTML error page. A link that fails any of that is **blanked** (drawn as
+not an HTML error page, and not a HEIC / AVIF either (MuPDF draws only JPEG
+and PNG `data:` images, though the same file uploaded as a document of its
+own is fine). A link that fails any of that is **blanked** (drawn as
 nothing, as before) and becomes a warning naming why; it never fails the
 request:
 
@@ -526,13 +728,14 @@ Every layer the job produced is listed in its document's
 Each `llm` unit — one criterion on one item — is **one scoring call of its
 own**: that item's page image (the ≤1000-px working copy) plus the text layer
 its `options.ocr` produced on that page — a
-`DOCUMENT TEXT (extracted, may contain OCR errors)` block, truncated at
-`CLASSIFIER_TEXT_CHAR_BUDGET` (60 000 characters) with a note when truncated —
-and the rubric its `options.hint` selects. The answer is one flat JSON object,
+`DOCUMENT TEXT (extracted, may contain OCR errors)` block, truncated at its
+model's `text_char_budget` (muse-glimmer: 60 000 characters) with a note when
+truncated — and the rubric its `options.hint` selects. A text-only model
+([§ Models](#models)) gets the text and no image. The answer is one flat JSON object,
 `{"score", "verdict", "confidence", "reason"}`; the verdict is always
 recomputed from the clamped score. What was sent is in the result's
-`detail`: `{metric: "score", value, hint, image_sent, text_sent: {chars, truncated,
-budget, source}}` — `value` is the score, and null for a `score: false`
+`detail`: `{metric: "score", value, hint, model, image_sent, text_sent: {chars,
+truncated, budget, source}}` — `model` is the registry id that answered — `value` is the score, and null for a `score: false`
 criterion (see [§ Result details](#result-details--the-same-shape-on-every-type)).
 
 > **Images per call.** A unit is one item, so its page image is the one
@@ -540,10 +743,11 @@ criterion (see [§ Result details](#result-details--the-same-shape-on-every-type
 > call with ten images. Every call that is not reference-guided — the plain
 > scoring call, the box loop's ask / refine / verify, a reference's describe
 > call, the `auto` selection call — sends exactly one image. Only a
-> reference-guided scoring call carries more: up to
-> `VISION_LLM_MAX_IMAGES_PER_PROMPT` (3) — a PASS example, a FAIL example and
-> the candidate ([§ References](#references)). `muse-glimmer` runs with
-> `--limit-mm-per-prompt '{"image": 3}'` for this; the knob must match it.
+> reference-guided scoring call carries more: up to the model's
+> `max_images_per_prompt` (muse-glimmer: 3) — a PASS example, a FAIL example
+> and the candidate ([§ References](#references)). `muse-glimmer` runs with
+> `--limit-mm-per-prompt '{"image": 3}'` for this; its registry entry must
+> match it.
 
 A document with no page image sends a text-only prompt (still
 `response_format: json_object`), and the system prompt tells the model to judge
@@ -710,9 +914,17 @@ never be treated differently.
     {"type": "text", "data": "Notice to Owner …"}
   ],
   "criteria": [ … ],
-  "references": ["r1a2b3c4d5e6f"]
+  "references": ["r1a2b3c4d5e6f"],
+  "model": "muse-glimmer"
 }
 ```
+
+`model` is optional — the job's model, a registry id from `GET /models`, used
+by every `llm` criterion (and `cv` llm fallback) without its own
+`options.model` and by the `auto` selection call. Omitted: the registry
+default. Unknown or unavailable is a 400 listing the valid ids; what each
+criterion's effective model can do is checked at submit (see
+[§ Models](#models)).
 
 `references` is optional — stored worked examples to show the vision model
 beside each llm-answered criterion: a list of reference ids, `"auto"`, or
@@ -741,6 +953,7 @@ sending neither.
 | `text` | at least one `file` or `text` | Inline text, same as the JSON `type: "text"`. Repeatable; an empty one is a 400 |
 | `criteria` | no | The same JSON array as the JSON body's `criteria`, as a string, **once** — it covers every document. Omitted: with explicit `references`, the references' criteria ([inherited](#using-them--references-on-assess)); otherwise the four default quality criteria. The form parser no longer fills the defaults in itself, so the model can tell "omitted" from "sent" |
 | `references` | no | **Once**: a JSON array of reference ids, the word `auto`, or the JSON `{"auto": true, …}` object |
+| `model` | no | **Once**: the job's model, a plain registry id (`muse-glimmer`) — same as the JSON `model` |
 
 The documents are taken in **form order**, `file`, `image` and `text` parts
 interleaved exactly as sent (note that a client building the form from
@@ -768,9 +981,9 @@ in `options`:
 
 | `type` | `options`, with defaults |
 |---|---|
-| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it — [§ References](#references); only with `references`), `aggregate` |
+| `llm` | `hint` (`quality` \| `presence` \| `auto`, default `auto`), `boxes` (default **`false`** — the [bounding-box loop](#the-llm-enforcement-loop)), `max_attempts` (default and cap `CLASSIFIER_LLM_BBOX_MAX_ATTEMPTS`; may be lowered, never raised), `ocr` (`auto` \| `always` \| `never`, default `auto` — the text layer sent with the prompt), `reference` (how the request's references guide it — [§ References](#references); only with `references`), `model` (a registry id from `GET /models`; default: the request's `model`, else the registry default — [§ Models](#models)), `aggregate` |
 | `text` | `pattern` (default: the name; max 500 characters), `match` (`contains` default \| `exact` \| `regex` \| `fuzzy`), `case_sensitive` (`false`), `fuzzy_threshold` (`0.85`, 0–1), `min_count` (`1`, 1–1000, `CLASSIFIER_TEXT_MIN_COUNT_CAP`), `ocr` (`auto`), `scope` (`page` default \| `document` — [text across pages](#text-across-pages--scope-document)), `aggregate` |
-| `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `reference` (only when the llm fallback is what answers). `aggregate` |
+| `cv` | `fallback` (`detector` \| `llm`) — what answers when no OpenCV detector matches the name. Default: `detector` when `DETECTOR_URL` is configured on this container, `llm` otherwise. `reference` and `model` (only when the llm fallback is what answers — `model` picks the fallback's registry model). `aggregate` |
 | `detector` | `threshold` (0–1, default `DETECTOR_MIN_SCORE`), `aggregate` |
 
 `aggregate` is on every type — a rule (`any` \| `worst` \| `all` \| `mean` \|
@@ -802,11 +1015,21 @@ nothing is queued:
   not answer, or with no `references`; a bad `references` list; and the
   store-checked ones (unknown ids, a reference not ready — **409**, an
   inheritance conflict). The full table is in
-  [§ References](#refusals-at-submit).
+  [§ References](#refusals-at-submit);
+* an unknown or unavailable `model` / `options.model` (the message lists the
+  valid ids), `options.model` on a `cv` name an OpenCV detector or the
+  detector service answers, and what an effective model cannot do: a
+  text-only model with `options.boxes`, with `references`, as a `cv` llm
+  fallback, as the job model of `references: "auto"`, or on a photo with no
+  OCR; a model with fewer than 2 images per prompt with `references` — see
+  [§ Models](#models).
 
 Each result echoes `options_used`: the options after defaults and caps, so
 `pattern` shows the name it defaulted to and `max_attempts` the cap it was
-held to.
+held to. `options.model` appears there only when sent; the model that
+actually answered is `detail.model`. `options.model` is not part of a
+criterion's identity — a reference saved under one model guides the same
+criterion on any other.
 
 ### The four types
 
@@ -980,6 +1203,25 @@ every type through the pipeline and fails if a `detail` carries a key its
 declaration does not list or misses one it requires; it also checks that each
 type's spec is the one its own evaluator declares.
 
+**Declaring a shape.** The standard is: declare it next to the code that
+produces it, and register it under the key its consumers look it up by.
+
+- An OpenCV detector's `detail` is declared with `@describes(DetectorSpec(...))`
+  on the detector function (`ai/classifier/cv/result.py`); the detector
+  `REGISTRY` is the lookup and `GET /cv-detectors` serves it.
+  `unit-tests/classifier/test_cv_measurements.py` runs every detector.
+- A criterion type's `detail` is declared with `@result_spec(ResultSpec(...))`
+  on that type's evaluator (`analysis/{llm,text,detector,cv}_eval.py`); it
+  registers by type name in `analysis/result_specs.py`, which the aggregator,
+  the scheduler and `GET /criterion-types` look up by. A new type's module is
+  also listed once in `result_specs._DECLARING_MODULES`.
+- `detail.reference` is ONE shared declaration, `REFERENCE_FIELD` in
+  `analysis/result_specs.py`, listed on `LLM_RESULT` only.
+
+Both tests fail on an undeclared key, a missing required key, or a wrong
+`metric` / `value`. Adding a detector, a criterion type, or a key to an
+existing `detail` updates its declaration in the same change.
+
 ### Dependencies
 
 `depends_on` names another **scored** criterion, and is gated **per item**:
@@ -1020,7 +1262,8 @@ llm.
 
 ## References
 
-A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG, an SVG, or one
+A **reference** is a stored, reviewed example: ONE page — a JPEG/PNG/HEIC/HEIF/AVIF
+photo, an SVG, or one
 page of a PDF — with the criteria asked of it, the answer each one should get
 (`score`, `verdict`, `reason`) and where on the page the feature is. An
 `/assess` that lists references shows the vision model those examples **beside
@@ -1055,18 +1298,20 @@ JSON, or multipart parsed into the same model (`api.reference_schemas.ReferenceR
   "region_units": "px",
   "title": "Brick house, front",
   "description": "A two-storey brick house photographed from the street.",
-  "tags": ["houses", "exterior"]
+  "tags": ["houses", "exterior"],
+  "model": "muse-glimmer"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
+| `document` + `page` | The example page: base64, URL (SSRF-checked, fetched at submit) or — refused — inline text. A JPEG/PNG/HEIC/HEIF/AVIF photo or an SVG (page `0`), or page `page` (0-based, default 0) of a PDF. `.txt` / `.docx` are a 400: a reference is shown to the model as an image |
 | `from_job` + `from_job_item` | **Instead of a document**: save item `from_job_item` (default 0) of a completed `/assess` job — see below |
 | `criteria` | The same `CriterionInput` list as `/assess` (the same cross-criterion rules). Required with `document`; with `from_job`, omitted means the job's own. `options.reference` is refused here — a reference's own criteria are never guided |
 | `breakdown` | `{name: {score, verdict?, reason?}}` — the answer key. `verdict` is optional and must be the score's (`score 3` with `verdict PASS` is a 400). Not allowed on a `score: false` criterion. A name left out is classified by the creation job |
 | `regions` | `{name: [{"box": [x1, y1, x2, y2]} \| {"polygon": [[x, y], …]}]}` — where. A name left out is **located** by the creation job; `[]` means **the whole page** is the example |
 | `region_units` | `px` (default — ORIGINAL page pixels, after EXIF rotation; one pixel of overshoot is tolerated and clamped) \| `grid` (0–1000 on both axes; recommended for a PDF page, whose pixel size depends on `CLASSIFIER_PDF_RENDER_DPI`) |
+| `model` | Optional: the creation job's registry model (`GET /models`) — scoring, the box loop and the description. Must be a **vision** model (400 otherwise), and so must every criterion's own `options.model`: a reference is an image example. Default: the registry default |
 | `title` / `description` / `tags` | Catalogue metadata, the only editable part (`PATCH`). Title ≤ 120 characters; description ≤ `CLASSIFIER_REFERENCE_DESCRIPTION_MAX_CHARS` (500) — **omitted, it is generated** from the page by one model call when `CLASSIFIER_REFERENCE_DESCRIBE` is on; tags are lowercased, stripped and de-duplicated, at most 20 of ≤ 40 characters |
 
 Multipart: ONE `file` part (or the legacy `image`), and the other keys as
@@ -1199,16 +1444,17 @@ unchanged.
 ### What the model is shown, and what it costs
 
 A guided criterion's ONE scoring call per item becomes one call per **example
-group**, all in flight together (each takes its own `CLASSIFIER_MAX_LLM_CALLS`
-slot):
+group**, all in flight together (each takes its own slot of the model's
+`max_concurrent`), planned for that criterion's model:
 
-* With `VISION_LLM_MAX_IMAGES_PER_PROMPT` ≥ 3 (the default), call *i* pairs the
+* With `max_images_per_prompt` ≥ 3 (muse-glimmer), call *i* pairs the
   *i*-th PASS-side example (PASS, then MARGINAL, in list or rank order) with
   the *i*-th FAIL example — **one contrastive call, three images**: the
   example, the counter-example, the candidate. One polarity only: two images.
   So one PASS + one FAIL reference is ONE call; two PASS references are two.
-* With `VISION_LLM_MAX_IMAGES_PER_PROMPT` = 2, every example is its own
-  two-image call. With 1, `references` is a 400 at submit.
+* With `max_images_per_prompt` = 2, every example is its own
+  two-image call. With 1, or a text-only model, `references` is a 400 at
+  submit for a criterion that uses them.
 
 Each example is shown as its caption then its composite — *"REFERENCE EXAMPLE
 — in this reference 'has a house' was PASS (10): a two-storey brick house; the
@@ -1251,7 +1497,7 @@ against an example that is the whole page is a 400 at submit (explicit ids).
 
 | Status | Rule |
 |---|---|
-| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` while `VISION_LLM_MAX_IMAGES_PER_PROMPT` < 2; unknown ids (all named); an inheritance conflict (both references named); `auto` without `criteria`; an `options.reference.criterion` no listed reference has; more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
+| 400 | `options.reference` with no `references`; `options.reference` on a `text` / `detector` / OpenCV-answered `cv` criterion; `position: "check"` without `boxes` or with hint `quality`, or on `cv`; an empty list, duplicate ids, a malformed id, more than `CLASSIFIER_REFERENCE_MAX_PER_REQUEST`; `references` on a criterion (that uses them) whose model has `max_images_per_prompt` < 2 or is text-only; `auto` with a text-only job model; unknown ids (all named); an inheritance conflict (both references named); `auto` without `criteria`; an `options.reference.criterion` no listed reference has; more than `CLASSIFIER_REFERENCE_MAX_PER_CRITERION` examples for one criterion; `position: "check"` against a whole-page example |
 | 409 | A listed reference is not `ready` (`pending` or `failed`) |
 
 ### Retention
@@ -1281,8 +1527,8 @@ Metrics: `classifier_references{status}`, `classifier_reference_bytes`,
 
 ## Model usage
 
-Every HTTP request the classifier makes to the vision model
-(`VISION_LLM_API` / `VISION_LLM_MODEL`) — each scoring call, each box-loop
+Every HTTP request the classifier makes to a model (any
+[`models.yaml`](models.yaml) entry) — each scoring call, each box-loop
 ask / refine / verify, each `references: "auto"` selection and reference
 description, **and each parse retry** — is written as one row of the
 `llm_calls` table in `classifier-db` (the same Postgres database as the jobs
@@ -1299,12 +1545,13 @@ model's time goes across the process; these rows say what **one job** cost.
 | `id` | Row id, in insert order |
 | `job_id` / `job_type` | The job that made the call (`assess` \| `reference`); `null` for a call made outside a job (none today) |
 | `request_id` | The correlation id of the HTTP request that queued the job (`X-Request-ID`) |
-| `started_at` | When the request went out (`TIMESTAMPTZ`; the API returns it as a UTC ISO string) (after its `CLASSIFIER_MAX_LLM_CALLS` slot was granted) |
+| `started_at` | When the request went out (`TIMESTAMPTZ`; the API returns it as a UTC ISO string) (after its model's `max_concurrent` slot was granted) |
 | `label` / `kind` | The call site's label (`score/<name>`, `bbox/<name>#2`, `reference/select#3`, …) and its kind — the same `score` / `ask` / `refine` / `verify` / `select` / `describe` / `other` the metrics use |
 | `criterion` / `item` / `document` | The unit it was for. A selection call has its `item` and `document` but **no** `criterion` — it is made once per item on behalf of every criterion there; a `scope: "document"` unit has `item` `null`; a reference's describe call has none of them |
 | `attempt` | 1-based parse-retry number (`MAX_LLM_RETRIES`) |
-| `model_requested` / `model_reported` | The `model` the request sent, and the one the response named |
-| `api_url` / `max_tokens` | `VISION_LLM_API`, and the request's completion budget |
+| `model_id` | The registry id (`models.yaml`) the request was addressed to; `null` on rows written before the registry |
+| `model_requested` / `model_reported` | The `model` the request sent (the entry's `served_name`), and the one the response named |
+| `api_url` / `max_tokens` | The URL the request was actually posted to, and its completion budget |
 | `outcome` | `ok` (a 2xx) \| `error` (transport failure, timeout, non-2xx) |
 | `http_status` / `error` | For an error: the status of a non-2xx (`null` for a timeout or a refused connection) and `"<ExceptionClass>: <message>"` |
 | `finish_reason` | `stop`, or `length` when the budget ran out (often mid-reasoning, which then costs a retry) |
@@ -1461,7 +1708,7 @@ Inside `job.result`, `schema_version: 3` — here for a two-page invoice plus a
 | `detector` | What the open-vocabulary detector did for the whole job (was `document_info.detector`) |
 | `artifacts` | The job's files — each [labelled](#file-labels) with `kind`, `format`, `item`, `document`, `criteria`, exactly as the manifest endpoint labels them — and, under `items`, each item's combined layer URLs (items with a page image only) |
 | `references` | `null` when the request listed none. Otherwise `{mode: explicit \| auto, requested, pool (auto: the ids fixed at submit; else null), pool_truncated, resolved (the ids used — auto: those some item's selection kept), inherited, criteria: {name: {matched, use, combine, position, examples: [{reference_id, criterion, polarity, expected}]}}, selection: [{item, status: ok \| failed \| skipped, matches: [{id, confidence, reason}], dropped, error, reason}], calls (guided scoring calls), selection_calls}`. Under `auto`, `criteria[*].examples` is empty — each item's picks are in `selection` and each unit's `detail.reference` |
-| `request` | `{"criteria": [...]}` — the criteria exactly as validated (`depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
+| `request` | `{"criteria": [...], "model": "<id>"}` — `model` is the job's model, resolved (the request's `model`, else the registry default); the criteria exactly as validated (`depends_on`, `weight`, every option as sent; inherited ones when `criteria` was omitted). What `POST /references` `from_job` rebuilds a job's criteria from |
 | `usage` | What the job's vision-model requests cost — the `totals` block of [`GET /jobs/{job_id}/usage`](#get-jobsjob_idusage): `calls` (every HTTP request, parse retries included), `errors`, `seconds`, `prompt_tokens` / `cached_tokens` / `completion_tokens` / `reasoning_tokens` / `total_tokens` (`null` when no call reported one), `models`, `first_call_at` / `last_call_at`, and `usage_url` for the per-call rows. `calls: 0` when nothing asked the model (`text` / `cv` criteria only). Added by the queue after the runner returns, so a `reference` job's result carries it too. See [§ Model usage](#model-usage) |
 
 **Every criterion has the same keys**, whatever its type or status. The keys
@@ -1788,6 +2035,13 @@ vision-LLM call. The classifier reaches it at `DETECTOR_URL`; **empty means
 off**, and then a `detector` criterion is refused at submit and a `cv`
 criterion's fallback resolves to the llm.
 
+| Classifier knob (default) | What |
+|---|---|
+| `DETECTOR_URL` (empty) | `http://detector:8000` once `ai/detector` is up — both containers are on `ai_shared`. Empty: a `detector` criterion, or a `cv` one with an explicit `options.fallback: "detector"`, is a 400 at submit |
+| `DETECTOR_MIN_SCORE` (0.25) | Used **twice on purpose**: sent as the detector's `threshold`, and the line a detector-scored criterion must clear to PASS from boxes alone (table below). A `detector` criterion's `options.threshold` overrides it. Two separate floors would mean boxes that count as regions but not as evidence |
+| `DETECTOR_TIMEOUT_S` (30) | Seconds one `POST /detect` may take. A page on the shared GPU answers in a few hundred ms; the CPU fallback takes a few seconds. Generous for either without letting a wedged service hold a classifier worker |
+| `DETECTOR_MAX_LABELS_PER_CALL` (16) | Labels per detector request. The detector embeds each label as its own query, so its cost is linear; a page needing more is split across calls rather than rejected. Keep it at or below the detector's own `DETECTOR_MAX_LABELS` (32) |
+
 | Spelling | What happens |
 |---|---|
 | `{"name": "has roof vent", "type": "detector"}` | Answered by the detector at `options.threshold`: boxes **and** a score |
@@ -1869,6 +2123,18 @@ lines from 0/8 to 7/8 and the mean y error from 48 units to 2.4. Both are on
 by default and both are recorded on the attempt. What the second pass cannot
 fix is *identification*: asked for a logo, a model that boxes the heading
 naming the same company 90 units lower is precisely placed on the wrong thing.
+
+**The grid step.** `CLASSIFIER_LLM_BBOX_GRID_STEP` (100 grid units) spaces the
+lines on the ask image and on the refine crop (which gets its own grid in its
+own frame); both the drawn overlay (`common.vision.draw_grid_overlay`) and the
+prompt sentence that describes it read it, so they cannot drift. Use a divisor
+of 1000 (`50`, `100`, `200`, `250`) so the last line lands on the edge; the
+floor is `10`. Denser is not automatically better: at `50` on a ≤1000-px page
+the edge labels start to overlap each other and the content. Change it, then
+re-run `bin/grounding_experiment.py` (below) before trusting the new value.
+`CLASSIFIER_LLM_BBOX_GRIDLINES=false` sends the bare image; a caller of
+`locate_criterion` without the working page image gets the bare-image ask and
+a prompt that does not mention a grid.
 
 **When it runs.** All four have to hold, or the loop costs nothing:
 
@@ -1961,15 +2227,19 @@ behaviour, not just the log.
 **Cost.** One ask per attempt, plus one refine and one verify per attempt
 whose coarse box validated — at most `3 × max_attempts` small calls per
 located criterion (`2 ×` with `CLASSIFIER_LLM_BBOX_REFINE=false`), each capped
-at `CLASSIFIER_LLM_BBOX_MAX_TOKENS` (1024) and each counted against
-`CLASSIFIER_MAX_LLM_CALLS`. Metric:
+at the criterion's model's `max_tokens.box` (muse-glimmer: 1024) and each
+counted against that model's `max_concurrent`. Every call goes to the same
+model the criterion was scored on; a text-only model never runs the loop
+(boxes are refused at submit). Metric:
 `classifier_llm_bbox_attempts_total{outcome=accepted|rejected_invalid|rejected_verify|exhausted}`.
 
 **Before trusting it on a new model**, run the grounding experiment:
 
 ```bash
-# On the box (it talks to VISION_LLM_API directly)
+# On the box (it talks to a models.yaml entry's URL directly — the default
+# unless --model names another vision entry)
 docker compose exec classifier python bin/grounding_experiment.py
+docker compose exec classifier python bin/grounding_experiment.py --model qwen2.5-vl
 docker compose exec classifier python bin/grounding_experiment.py \
   --images /data/roof-photos --criteria /data/criteria.json --out /data/grounding.json
 ```
@@ -2093,6 +2363,46 @@ curl http://localhost:8005/health
 
 ---
 
+### `GET /models`
+
+The model registry ([§ Models](#models)): every model a request's `model` or
+a criterion's `options.model` may name, in `models.yaml` order. Never a key
+value — only whether the entry is `authenticated`.
+
+```bash
+curl http://localhost:4001/v1/classifier/models -H "Authorization: Bearer sk-1234"
+```
+
+```json
+{
+  "default": "muse-glimmer",
+  "models": [
+    {"id": "muse-glimmer",
+     "description": "Muse Glimmer 30B on vLLM (…). Vision, 3 images per prompt: …",
+     "served_name": "muse-glimmer",
+     "endpoint": {"scheme": "http", "host": "muse-glimmer", "port": 8000},
+     "authenticated": false, "available": true, "unavailable_reason": null,
+     "vision": true, "max_images_per_prompt": 3,
+     "supports": {"boxes": true, "references": true, "contrastive_references": true,
+                  "text_only_scoring": false},
+     "reasoning": {"style": "chat_template_kwargs", "key": "reasoning_strength", "value": "low"},
+     "text_char_budget": 60000,
+     "max_tokens": {"score": 8192, "box": 1024, "select": 2048, "describe": 1024},
+     "timeout_s": 240.0, "max_concurrent": 6, "in_flight": 0},
+    {"id": "qwen2.5-vl", "…": "…"},
+    {"id": "qwen3.5-4b", "…": "…"},
+    {"id": "qwen3.8-solo", "…": "…"}
+  ]
+}
+```
+
+`endpoint.host` is where a request's pages and text go — an external host
+means the data leaves the box. `available: false` (with `unavailable_reason`)
+is an entry whose API key variable is unset; selecting it is a 400.
+`in_flight` is that model's requests in flight right now.
+
+---
+
 ### `GET /criterion-types`
 
 Every criterion type's options, for THIS container — the schema is generated
@@ -2109,7 +2419,8 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
     "llm": {
       "options_schema": {"type": "object", "additionalProperties": false,
                          "properties": {"hint": {"…": "…"}, "boxes": {"…": "…"},
-                                        "max_attempts": {"…": "…"}, "ocr": {"…": "…"}}},
+                                        "max_attempts": {"…": "…"}, "ocr": {"…": "…"},
+                                        "model": {"…": "…"}}},
       "defaults": {"hint": "auto", "boxes": false, "max_attempts": 3, "ocr": "auto",
                    "aggregate": {"pages": "worst", "documents": "worst"}},
       "caps": {"max_attempts": 3}
@@ -2133,9 +2444,19 @@ curl http://localhost:4001/v1/classifier/criterion-types -H "Authorization: Bear
     "excluded": "…", "text_scope_document": "…"
   },
   "aggregate_detail": {"rule": "…", "level": "…", "from": "…", "values": "…"},
+  "model": {"applies_to": "llm criteria, and cv criteria answered by the llm fallback",
+            "precedence": "options.model, then the request's `model`, then the registry default",
+            "default": "muse-glimmer",
+            "models": ["muse-glimmer", "qwen2.5-vl", "qwen3.5-4b", "qwen3.8-solo"],
+            "catalog": "GET /models", "identity": "…"},
   "detector_configured": true
 }
 ```
+
+`reference.caps` no longer carries `images_per_llm_prompt` — images per
+prompt is per model (`GET /models`), and `reference.requires_model` says so.
+`options.model` never appears in a type's `defaults` (it is echoed only when
+sent).
 
 Each type also carries **`result`**, the shape of the `detail` it returns:
 
@@ -2164,7 +2485,12 @@ is always present; `stable` marks what survives a `mean` aggregate.
 [§ Result details](#result-details--the-same-shape-on-every-type).
 
 `text.defaults.pattern` shows `<name>` because it defaults to the criterion's
-name. `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
+name. `caps.pattern_max_chars` (500) is not a knob: it lives in
+`common.documents.textmatch`, which enforces it for every caller;
+`caps.min_count` is `CLASSIFIER_TEXT_MIN_COUNT_CAP` and the `name` cap
+`CLASSIFIER_CRITERION_NAME_MAX_CHARS` (for `llm` criteria the name is the
+prompt text, and every name is slugified into artifact file names, so it
+bounds both). `cv.defaults.fallback` is `detector` only while DETECTOR_URL is set.
 Each type's `defaults.aggregate` is for its default options (an `llm`
 criterion's defaults change with its hint — the top-level `aggregate.defaults`
 has the whole table).
@@ -2270,21 +2596,25 @@ its declaration does not list — so this endpoint describes exactly what
 ### `GET /document-kinds`
 
 What this container can accept and do right now: the five kinds (with
-`pdf.pages` saying every page is an item, and `svg.external_images` the live
-[SVG fetch](#external-references-in-svg) setting), the `.doc` and `.svgz`
-rejections, the accepted inputs, the four `text_match_modes`, the live OCR
-status, the limits, and the regions block.
+`image.formats` the image formats this container can decode, `pdf.pages`
+saying every page is an item, and `svg.external_images` the live
+[SVG fetch](#external-references-in-svg) setting), the `.doc`, `.svgz` and
+video rejections, the accepted inputs, the four `text_match_modes`, the live
+OCR status, the limits, and the regions block.
 
 ```json
 {
-  "kinds": [{"kind": "image", "pages": "1 — one item", "…": "…"},
+  "kinds": [{"kind": "image", "extensions": [".jpg", ".jpeg", ".png", ".heic", ".heif", ".avif"],
+             "content_types": ["image/jpeg", "image/png", "image/heic", "image/heif", "image/avif"],
+             "pages": "1 — one item", "…": "…",
+             "formats": ["jpeg", "png", "heic", "heif", "avif"]},
             {"kind": "pdf", "pages": "any — every page is one item; the request's total items are capped at CLASSIFIER_MAX_ITEMS (counted at submit, without rendering)", "…": "…"},
             {"kind": "svg", "extensions": [".svg"], "content_types": ["image/svg+xml"],
              "pages": "1 — one item", "has_page_images": true, "native_text": true, "…": "…",
              "external_images": {"fetch": false, "max_images": 10, "max_bytes": 5000000,
                                  "timeout_s": 10.0, "accepted": ["image/png", "image/jpeg"],
                                  "redirects": "not followed", "when": "…"}}, "…"],
-  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}],
+  "unsupported": [{"kind": "doc", "…": "…"}, {"kind": "svgz", "…": "…"}, {"kind": "video", "…": "…"}],
   "inputs": {"json": ["base64", "url", "text"],
              "json_shape": "documents: [{type, data, filename?}, ...] — or document: {...} for one; not both",
              "multipart": ["file (or legacy 'image'), repeatable", "text, repeatable"]},
@@ -2295,9 +2625,10 @@ status, the limits, and the regions block.
           "text_layer_artifact": "text.p<item>.<key>.json per item and distinct setting; text.d<document>.<key>.json for a scope-document text search"},
   "limits": {"max_items": 20, "items": "every page of every document is one item; the cap is inclusive and counted at submit",
              "pdf_render_dpi": 150, "svg_max_render_pixels": 25000000,
-             "llm_text_char_budget": 60000,
-             "images_per_llm_prompt": 3, "max_concurrent_jobs": 4,
-             "max_units_per_job": 6, "max_llm_calls": 6, "ocr_workers": 4},
+             "max_concurrent_jobs": 4, "max_units_per_job": 6, "ocr_workers": 4,
+             "models": "per model — GET /models (text_char_budget, max_images_per_prompt, max_concurrent, timeout_s)",
+             "default_model": {"id": "muse-glimmer", "llm_text_char_budget": 60000,
+                               "images_per_llm_prompt": 3, "max_concurrent": 6}},
   "regions": {
     "always_stored": true, "layers": ["png", "preview", "svg"],
     "layers_rendered": "on first fetch, then cached",
@@ -2311,6 +2642,7 @@ status, the limits, and the regions block.
   },
   "references": {
     "enabled": true, "images_per_llm_prompt": 3, "contrastive": true,
+    "per_model": "GET /models supports.references / contrastive_references",
     "max_count": 500, "max_per_request": 10, "max_per_criterion": 3,
     "auto": true, "auto_pool_max": 20, "auto_min_confidence": 60,
     "applies_to": "llm criteria, and cv criteria answered by the llm fallback",
@@ -2319,8 +2651,12 @@ status, the limits, and the regions block.
 }
 ```
 
-`references.enabled` is false when `VISION_LLM_MAX_IMAGES_PER_PROMPT` is 1;
-`contrastive` (a PASS and a FAIL example in one call) needs 3.
+The text budget, images per prompt and model-call limit are per MODEL now:
+`limits.default_model` and `references.enabled` / `images_per_llm_prompt` /
+`contrastive` are the DEFAULT model's values, labelled as such — `GET /models`
+has every model's. `references.enabled` is false when that model takes one
+image per prompt; `contrastive` (a PASS and a FAIL example in one call) needs
+3.
 
 `ocr.available` loads the engine to answer honestly — `false` when
 `CLASSIFIER_OCR_ENGINE=none` **and** when the engine failed to load.
@@ -2384,7 +2720,11 @@ and every reference rule ([§ References — Refusals](#refusals-at-submit));
 a Content-Type that is neither JSON nor multipart; **502** when a document URL
 cannot be fetched; **500** if the payload could not be persisted. A page image
 under `CLASSIFIER_MIN_IMAGE_WIDTH` × `CLASSIFIER_MIN_IMAGE_HEIGHT` (32 × 32 px)
-fails the JOB with "Image too small".
+fails the JOB with "Image too small". It is a thumbnail-catcher only — OCR
+upscales small pages itself, the vision model takes any size, and the
+working-image step only shrinks. It was a hard-coded 100 × 100, which refused a
+crop of one text line submitted as its own document (what `regions_report.py
+--pipeline utility-bill` does in stage 3).
 
 ---
 
@@ -2572,8 +2912,9 @@ directory. Afterwards the other artifact endpoints answer **410**.
 
 ### `GET /jobs/{job_id}/usage`
 
-Every vision-model request the job made, in the order they were made, with
-the totals ([§ Model usage](#model-usage) has what each field means).
+Every model request the job made, in the order they were made, with the
+totals, per kind / outcome / criterion / model ([§ Model usage](#model-usage)
+has what each field means).
 
 ```bash
 curl http://localhost:8005/jobs/abc123/usage | jq '{totals, by_kind}'
@@ -2595,10 +2936,12 @@ curl http://localhost:8005/jobs/abc123/usage | jq '.calls[] | {label, criterion,
   "by_outcome": {"ok": {"calls": 4, "…": "…"}},
   "by_criterion": [{"criterion": "has a house", "calls": 3, "errors": 0, "seconds": 29.1, "…": "…"},
                    {"criterion": "has a roof", "calls": 1, "…": "…"}],
+  "by_model": [{"model": "muse-glimmer", "calls": 4, "errors": 0, "…": "…"}],
   "calls": [
     {"id": 812, "job_id": "abc123", "job_type": "assess", "request_id": "req-xyz",
      "started_at": "2026-07-30T15:00:01.204311+00:00", "label": "score/has a house",
      "kind": "score", "criterion": "has a house", "item": 0, "document": 0, "attempt": 1,
+     "model_id": "muse-glimmer",
      "model_requested": "muse-glimmer", "model_reported": "muse-glimmer",
      "api_url": "http://muse-glimmer:8000/v1/chat/completions", "max_tokens": 8192,
      "outcome": "ok", "http_status": null, "error": null, "finish_reason": "stop",
@@ -2611,11 +2954,12 @@ curl http://localhost:8005/jobs/abc123/usage | jq '.calls[] | {label, criterion,
 }
 ```
 
-Every block in `by_kind`, `by_outcome` and `by_criterion` has the same keys
-as `totals` (without `models` / `first_call_at` / `last_call_at`).
+Every block in `by_kind`, `by_outcome`, `by_criterion` and `by_model` has the
+same keys as `totals` (without `models` / `first_call_at` / `last_call_at`).
 `by_criterion` is a list because the calls that belong to no criterion — the
 per-item selection, a reference's description — are grouped under
-`"criterion": null`. `result.usage` on the job is `totals` plus `usage_url`.
+`"criterion": null`; `by_model` (by registry id, `model_id`) is a list for the
+same reason — rows written before the model registry have no id. `result.usage` on the job is `totals` plus `usage_url`.
 
 **200** for a job that has not called the model (yet, or at all) — zero
 `calls`. **200 with `job_present: false`** once the job has expired: the
@@ -2627,7 +2971,7 @@ usage row — an unknown id, or a job removed with `DELETE /jobs/{job_id}`.
 ### `GET /usage`
 
 Model usage across jobs: the totals (plus `jobs`, the distinct jobs counted),
-by call kind, and by UTC day. Includes the calls of jobs that have since
+by call kind, by model, and by UTC day. Includes the calls of jobs that have since
 expired.
 
 | Param | Effect |
@@ -2635,6 +2979,7 @@ expired.
 | `since` | Inclusive lower bound on a call's `started_at` — an ISO date (`2026-10-01`, its midnight UTC) or datetime (`2026-10-01T08:00:00Z`; no offset means UTC) |
 | `until` | Exclusive upper bound, same forms — `since=2026-10-01&until=2026-10-02` is one UTC day |
 | `job_type` | Only calls made by jobs of this type: `assess` \| `reference` |
+| `model` | Only calls addressed to this registry id (`GET /models`). Not checked against the registry — a model removed from `models.yaml` still has its rows |
 
 ```bash
 curl "http://localhost:8005/usage?since=2026-10-01&job_type=assess" | jq '{totals, by_day}'
@@ -2642,11 +2987,13 @@ curl "http://localhost:8005/usage?since=2026-10-01&job_type=assess" | jq '{total
 
 ```json
 {
-  "filter": {"since": "2026-10-01T00:00:00.000000+00:00", "until": null, "job_type": "assess"},
+  "filter": {"since": "2026-10-01T00:00:00.000000+00:00", "until": null, "job_type": "assess",
+             "model": null},
   "totals": {"calls": 1240, "errors": 3, "seconds": 9841.2, "prompt_tokens": 2810400,
              "cached_tokens": null, "completion_tokens": 561200, "reasoning_tokens": 488100,
              "total_tokens": 3371600, "models": ["muse-glimmer"], "jobs": 212},
   "by_kind": {"score": {"calls": 880, "…": "…"}, "ask": {"…": "…"}, "…": "…"},
+  "by_model": [{"model": "muse-glimmer", "calls": 1240, "…": "…"}],
   "by_day": [{"day": "2026-10-01", "calls": 190, "…": "…"}, {"day": "2026-10-02", "…": "…"}]
 }
 ```
@@ -2781,7 +3128,10 @@ assessment incomplete).
 
 [`unit-tests/classifier/documents/`](../../unit-tests/classifier/documents/)
 holds one generated fixture per document kind and failure mode — a native PDF,
-a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter, a
+a scanned PDF, a `.txt`, a `.docx`, a well and a badly photographed letter,
+the well-photographed one again as an iPhone portrait HEIC
+(`photo_of_letter.heic`: stored sideways, rotated by its container and its
+EXIF tag, so it comes out upright only if the rotation is applied once), a
 legacy `.doc`, and a two-page PDF whose sentence over the page break shows
 `options.scope: "document"` — each with the criteria to send and the result
 to expect, plus curl examples. The
@@ -2821,9 +3171,30 @@ container and no GPU. Setup, how to read the report, and how to add a case:
 [`unit-tests/classifier/REGIONS_REPORT.md`](../../unit-tests/classifier/REGIONS_REPORT.md).
 
 The unit tests (`unit-tests/classifier/test_*.py`) script the model at
-`llm.client._send` / `call_vllm` / `call_vllm_json` and never touch the
+`llm.client._send` / `call_model` / `call_model_json` and never touch the
 network. Everything that runs the app's lifespan or touches the jobs,
 references or usage tables needs Postgres: with `TEST_POSTGRES_DSN` set the
 session creates one `classifier_test_<pid>_<hex>` database and drops it at the
 end; without it those tests skip (marker `postgres` / fixture
 `need_postgres`, see `unit-tests/classifier/conftest.py`).
+
+### Running the unit tests
+
+```bash
+UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+TEST_POSTGRES_DSN=postgresql://postgres@localhost:55439/postgres \
+  UV_LINK_MODE=copy uv run --no-sync --with pytest --package classifier \
+  python -m pytest unit-tests/classifier -q -p no:cacheprovider
+```
+
+- **Without `TEST_POSTGRES_DSN` about a third of the suite skips** — a run
+  like that has not passed. The DSN is an admin connection on a scratch
+  server; each session creates and drops its own `classifier_test_*`
+  database. On Windows, a scratch server from the EDB binaries zip:
+  `initdb -U postgres --auth=trust`, then `pg_ctl -o "-p 55439" start`.
+- **`unit-tests/classifier` and `unit-tests/detector` run in separate pytest
+  processes**: both ship a top-level `config.py`, and the classifier's
+  conftest puts `ai/classifier` on `sys.path`.
+- Use `--no-sync`: `uv sync --package classifier` prunes the shared workspace
+  venv to the classifier's dependencies.
