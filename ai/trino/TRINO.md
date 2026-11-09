@@ -8,15 +8,18 @@ Postgres instances this repo runs (`litellm_db`, `roofix-db`, `sandbox-db`,
 per-call model usage, `postgres_classifier` — and the route-policy service's
 `route-policy-db` — every routing decision and what answered it,
 `postgres_route_policy`),
-the off-box Phoenix production Postgres (`postgres_phoenix`, read-only
-role, TLS required), plus an Iceberg lakehouse on `lake-s3`. Consumers:
+the off-box Phoenix production and staging Postgres (`postgres_phoenix_prod`
+/ `postgres_phoenix_stage`, read-only roles, TLS required), plus an Iceberg
+lakehouse on `lake-s3`. Consumers:
 
 - **Models** — LiteLLM registers `trino-mcp:8080/mcp` alongside the
   Phoenix MCP, so any tool-calling model can run federated SQL. Claude
   Code connects through LiteLLM's `/mcp/trino` — see
   [§ Using it from Claude Code](#using-it-from-claude-code).
-- **Humans** — Superset at `chat.zeoenergy.com/superset/` behind
-  oauth2-proxy.
+- **Humans** — Superset at `https://superset.zeoenergy.com/`
+  (`SUPERSET_PUBLIC_HOST`), behind its own oauth2-proxy instance,
+  `oauth2-proxy-superset` — see [§ Header-auth trust
+  boundary](#header-auth-trust-boundary).
 - **External BI tools** — Trino JDBC on `PORT_TRINO` (default 8013),
   HTTPS + password auth. See [§ JDBC authentication](#jdbc-authentication).
 
@@ -48,8 +51,8 @@ the whole stack takes ~90 s.
 | Trino JDBC | `jdbc:trino://<host>:8013?SSL=true&SSLVerification=NONE` | For DBeaver / DataGrip — see [§ JDBC authentication](#jdbc-authentication) |
 | Trino HTTP (internal) | `http://trino-coordinator:8080` | Container networks only, never published; username-only auth for `trino-mcp` / Superset |
 | lake-s3 S3 API | `http://<host>:8014` | S3-compatible, path-style only; keys are `LAKE_S3_ACCESS_KEY` / `LAKE_S3_SECRET_KEY` |
-| lake-s3 console | `https://chat.zeoenergy.com/rustfs/console/` | Behind oauth2-proxy; LAN fallback `http://<host>:8015/rustfs/console/` — see [§ Object store: RustFS](#object-store-rustfs) |
-| Superset | `https://chat.zeoenergy.com/superset/` | Behind oauth2-proxy |
+| lake-s3 console | `https://chat.zeoenergy.com/rustfs/console/` | Behind `oauth2-proxy-openwebui`; LAN fallback `http://<host>:8015/rustfs/console/` — see [§ Object store: RustFS](#object-store-rustfs) |
+| Superset | `https://superset.zeoenergy.com/` (`SUPERSET_PUBLIC_HOST`) | Behind `oauth2-proxy-superset`, served from the root; LAN `http://<host>:8016/` (edge, identity headers stripped, so it signs no one in) |
 | trino-mcp | `http://trino-mcp:8080/mcp` | Internal only, registered with LiteLLM; external clients use `http://<host>:4001/mcp/trino` |
 | HMS Postgres | `psql -h localhost -p 5436 -U hive metastore` | Operator inspection only |
 | Superset Postgres | `psql -h localhost -p 5437 -U superset superset` | Operator inspection only |
@@ -176,7 +179,7 @@ Clients that pinned the old fingerprint must re-trust.
 
 | Tool | Purpose |
 |---|---|
-| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `bigquery_supernova_dev`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
+| `list_catalogs()` | Every catalog Trino sees — `aws_glue`, `bigquery_supernova_dev`, `iceberg`, `postgres_classifier`, `postgres_litellm`, `postgres_phoenix_prod`, `postgres_phoenix_stage`, `postgres_roofix`, `postgres_route_policy`, `postgres_sandbox`, `postgres_supabase`, `supabase_ai_agents`, `supabase_enerflo_leads`, `supabase_operations_assistant`, `system` |
 | `list_schemas(catalog)` | Schemas under a catalog |
 | `list_tables(catalog, schema)` | Tables under a schema |
 | `describe_table(catalog, schema, table)` | `[{"name":…, "type":…}, …]` |
@@ -223,7 +226,7 @@ committing it.
 
 Everything in [§ Adding a catalog](#adding-a-catalog) applies here too:
 there is no per-catalog access control, so a Claude Code session with this
-server can read every catalog, `postgres_phoenix` production and
+server can read every catalog, `postgres_phoenix_prod` (production) and
 `postgres_supabase`'s `auth.users` included. The SELECT-only rule and the
 row / runtime clamps are the only limits. Full list of LiteLLM-hosted MCP
 servers: [`ai/litellm/LITELLM_MCP.md`](../litellm/LITELLM_MCP.md#add-mcp-servers-to-claude-code).
@@ -271,7 +274,7 @@ models get an accurate hint.
 - Convention: `<source>_<dataset>` — name by where the data lives, then
   what it is. `postgres_<subsystem>` for Postgres instances we run or
   are handed directly (`postgres_litellm`, `postgres_roofix`,
-  `postgres_sandbox`, `postgres_phoenix`, `postgres_supabase`,
+  `postgres_sandbox`, `postgres_phoenix_prod`, `postgres_phoenix_stage`, `postgres_supabase`,
   `postgres_classifier`, `postgres_route_policy`);
   `supabase_<project>` for Supabase-hosted projects (`supabase_ai_agents`,
   `supabase_enerflo_leads`, `supabase_operations_assistant`); `aws_glue` for the Glue Data Catalog;
@@ -309,7 +312,7 @@ the port in `.env`.
 
 ### Hosted Postgres gotchas
 
-Learned the hard way on `postgres_phoenix`, `supabase_ai_agents`, and
+Learned the hard way on `postgres_phoenix_prod`, `supabase_ai_agents`, and
 `supabase_enerflo_leads`:
 
 - **TLS.** Managed Postgres (Supabase, Phoenix, RDS) rejects plaintext.
@@ -469,34 +472,217 @@ authentication failed` → wrong secret or unescaped `$`).
 
 ## Header-auth trust boundary
 
-Superset is configured with `AUTH_TYPE = AUTH_REMOTE_USER` in
-`superset/superset_config.py`. It trusts `X-Auth-Request-Email` from
-oauth2-proxy as the session user with no separate password check.
+Superset runs `AUTH_TYPE = AUTH_REMOTE_USER` (`superset/superset_config.py`)
+and is served from the root of `SUPERSET_PUBLIC_HOST`
+(`superset.zeoenergy.com`) by its own oauth2-proxy instance,
+`oauth2-proxy-superset`
+([OAUTH2_PROXY.md § Superset on its own hostname](../oauth2-proxy/OAUTH2_PROXY.md#superset-on-its-own-hostname)):
+4.0.2 cannot run under a path prefix, so it is no longer at
+`chat.zeoenergy.com/superset/`. It trusts `X-Forwarded-Email`
+(`SUPERSET_REMOTE_USER_HEADER`) as the session user with no separate password
+check; the first visit creates the account (username = the e-mail, role
+`Alpha` — starting as Admin and changing roles:
+[§ Superset sign-in and roles](#superset-sign-in-and-roles)).
 
-**This is only safe when nothing but oauth2-proxy can hand Superset that
-header.** `superset` is swapped side by side by `make up` (see
-[ai/edge/EDGE.md](../edge/EDGE.md)), so `PORT_SUPERSET` (default 8016) is
-published by the `ai/edge` HAProxy rather than by `docker-compose.trino.yml`.
-oauth2-proxy reaches `superset:8088` directly over `ai_shared`, never through
-the edge, so the edge deletes `X-Auth-Request-Email` / `-User` /
-`-Preferred-Username` and `X-Forwarded-Email` / `-User` on that port: a LAN
-client can no longer spoof the header and log in as any Superset account, as it
-could while the port was published straight from this stack. Keep it that way:
+**How the header becomes a login.** Flask-AppBuilder 4.4.1, the version
+`apache/superset:4.0.2` pins, never reads request headers for
+`AUTH_REMOTE_USER`: its `/login/` view (`AuthRemoteUserView.login` in
+`flask_appbuilder/security/views.py`) logs in
+`request.environ[AUTH_REMOTE_USER_ENV_VAR]`, default `REMOTE_USER`, which
+nothing behind a proxy sets. So `superset_config.py` sets
+`AUTH_REMOTE_USER_ENV_VAR` to the WSGI environ key of the header,
+`HTTP_X_FORWARDED_EMAIL`. Superset sends a visitor without a session to
+`/login/?next=…` itself, and the view returns them to the page. (The config
+used to override a `get_user_identifier` method FAB 4.4.1 does not have, and
+named `X-Auth-Request-Email`, which oauth2-proxy only ever puts on responses:
+the header never signed anyone in.)
 
-- never route oauth2-proxy (or anything that sets the header legitimately)
-  through the edge;
-- if `SUPERSET_REMOTE_USER_HEADER` changes, add a `del-header` for the new name
-  in `ai/edge/haproxy.cfg`;
+**This is only safe when nothing but `oauth2-proxy-superset` can hand Superset
+that header:**
+
+- `oauth2-proxy-superset` deletes every client copy of `X-Forwarded-Email` —
+  any spelling, `X_Forwarded_Email` included — before it sets the real one
+  (`PASS_USER_HEADERS`). It does **not** delete a client's own
+  `X-Auth-Request-*`, which is why that family must never be trusted.
+- `superset` is swapped side by side by `make up` (see
+  [ai/edge/EDGE.md](../edge/EDGE.md)), so `PORT_SUPERSET` (default 8016) is
+  published by the `ai/edge` HAProxy rather than by `docker-compose.trino.yml`.
+  `oauth2-proxy-superset` reaches `superset:8088` directly over `ai_shared`,
+  never through the edge, so the edge's `listen superset` deletes
+  `X-Forwarded-Email` / `-User` and `X-Auth-Request-Email` / `-User` /
+  `-Preferred-Username`, plus every header whose name contains an underscore:
+  gunicorn 21.2.0 (Superset 4.0.2's) files `X_Forwarded_Email` under the same
+  environ key as `X-Forwarded-Email`, and an exact-name delete would let that
+  spelling through. A LAN client can neither spoof the header nor sign in on
+  8016.
+- Any container on `ai_shared` can still call `superset:8088` with any header —
+  the same posture as Trino's username-only `:8080`
+  ([§ JDBC authentication](#jdbc-authentication)).
+
+Keep it that way:
+
+- never route `oauth2-proxy-superset` (or anything that sets the header
+  legitimately) through the edge;
+- if `SUPERSET_REMOTE_USER_HEADER` changes, it must be a request header
+  oauth2-proxy sets (`X-Forwarded-*`, never `X-Auth-Request-*`), and the edge
+  needs a `del-header` for the new name in `ai/edge/haproxy.cfg`;
 - before exposing this host on an untrusted network, still bind the edge's
   `PORT_SUPERSET` mapping to loopback in `ai/edge/docker-compose.edge.yml`
   (`"127.0.0.1:${PORT_SUPERSET:-8016}:8016"`), or drop it and reach Superset
-  only via `chat.zeoenergy.com/superset/`.
+  only via `https://superset.zeoenergy.com/`.
 
-Superset is now the only service in the stack that trusts a proxy-set
-identity header. Open WebUI used the same pattern via
-`WEBUI_AUTH_TRUSTED_EMAIL_HEADER` and has since been moved to its own OIDC —
-[ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on)
-covers why, and the reasoning about reachability applies here unchanged.
+Superset's own session outlives a change of Google account in the same
+browser: the old Superset user stays signed in until you log out of Superset
+(top-right menu). Revocation is unaffected — `oauth2-proxy-superset` refuses
+every request from someone removed from the group at the next cookie refresh.
+
+**Behind the proxy.** `PROXY_FIX_CONFIG` counts the proxies that WRITE each
+`X-Forwarded-*` header on the public path (Cloudflare → cloudflared →
+`oauth2-proxy-superset` → superset): `x_for` 2 (Cloudflare sets the client,
+oauth2-proxy appends cloudflared), `x_proto` 1 (only Cloudflare writes it; at
+2 ProxyFix ignored the one value and Superset built `http://` URLs, its
+post-login redirect among them), and `x_host` / `x_port` / `x_prefix` 0
+(nobody sets them; both proxies keep the `Host` header). Served from the root,
+so no `APPLICATION_ROOT` or `STATIC_ASSETS_PREFIX`.
+
+Open WebUI is the other service that trusts `X-Forwarded-Email`; it also
+verifies it with Google using the forwarded access token, and binds
+`127.0.0.1:8007` only —
+[ai/openwebui/OPENWEBUI.md § Single sign-on](../openwebui/OPENWEBUI.md#single-sign-on).
+
+## Superset sign-in and roles
+
+**Signing in.** Open `https://superset.zeoenergy.com/` and sign in with Google
+on the usual Zeo AI sign-in page (the same `zeoai.access@zeoenergy.com` group
+gate as chat). There is no Superset password and no Superset login form: the
+first visit creates your account from the e-mail `oauth2-proxy-superset`
+passes (username = the e-mail), and every later visit signs you straight in.
+
+**What the first visit gives you: `Alpha`** (`AUTH_USER_REGISTRATION_ROLE` in
+`superset/superset_config.py`). In Superset 4.0.2 that means:
+
+| | `Alpha` | `Admin` |
+|---|---|---|
+| Dashboards, charts, datasets (view, explore, build your own) | yes | yes |
+| Edit the provisioned SGR charts / dashboard in place (they have no owner) | no — "Save as" a copy | yes |
+| SQL Lab | no — admin-only (`ADMIN_ONLY_VIEW_MENUS` in `superset/security/manager.py`) | yes |
+| Users, roles, database connections | no | yes |
+
+The bootstrap `admin` account (`SUPERSET_ADMIN_PASSWORD`, created by
+`superset/bootstrap.sh`) cannot be used from a browser: under
+`AUTH_REMOTE_USER` the identity is always the e-mail the proxy passes, and
+there is no password form to sign in as anyone else.
+
+**Starting as `Admin` — before your first visit.** Your sign-in finds an
+existing account by username and keeps its roles, so pre-create the account
+as an Admin once the database is set up (after the first `make up trino
+superset`) and before you open Superset. On the box, from the repo root:
+
+```bash
+make exec trino superset CMD="superset fab create-admin \
+  --username you@zeoenergy.com --firstname First --lastname Last \
+  --email you@zeoenergy.com --password $(openssl rand -hex 16)"
+```
+
+The username must be the exact e-mail you sign in with. The password is
+required by the command and never used. If the account already exists the
+command stops with `Error! User already exists` and changes nothing — use the
+next step instead.
+
+**Making an existing account `Admin`.** Flask-AppBuilder's CLI has no
+change-role command (`create-admin` / `create-user` refuse an existing
+username), so the first Admin is a row in `superset-db`:
+
+```bash
+docker exec -it superset-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+```sql
+INSERT INTO ab_user_role (user_id, role_id)
+SELECT u.id, r.id FROM ab_user u, ab_role r
+WHERE u.username = 'you@zeoenergy.com' AND r.name = 'Admin'
+ON CONFLICT DO NOTHING;   -- (user_id, role_id) is unique: safe to re-run
+```
+
+Then log out of Superset (top-right menu) and visit again so the session picks
+up the role. Once one Admin exists, manage everyone else in the UI:
+**Settings → List Users → edit** — e.g. add the built-in `sql_lab` role to give
+an `Alpha` user SQL Lab without making them Admin.
+
+**Removing access.** Take the person out of the Google group: the proxy refuses
+them at the next cookie refresh, whatever their Superset role. Their Superset
+account stays (inactive users can be set in **List Users**).
+
+## Counting LiteLLM SGRs
+
+LiteLLM Enterprise licensing meters **Successful Gateway Requests (SGRs)**:
+every call LiteLLM logs with a success status, counted once per request; a
+missing status counts as a success. Superset's **LiteLLM SGRs** dashboard
+(`https://superset.zeoenergy.com/superset/dashboard/litellm-sgrs/`) counts them
+per month from `LiteLLM_SpendLogs` (`postgres_litellm.public.litellm_spendlogs`,
+one row per call since June 2026):
+
+- **LiteLLM SGRs per month** — bars stacked by bucket, the month's total on
+  top of each.
+- **LiteLLM SGRs by month and bucket** — a pivot table (months × buckets, with
+  totals) holding the exact numbers to copy into an email. Set its time grain
+  to quarter or year in Explore for those totals.
+
+What is counted (the SQL's header comment says the same):
+
+- **Success** = `coalesce(nullif(status, ''), 'success') <> 'failure'`, one
+  row per `request_id` (the table's primary key).
+- **UTC months.** `starttime` is stored in UTC, so `date_trunc('month', …)`
+  cuts at 00:00 UTC on the 1st; a US-local month boundary moves a few hours of
+  traffic between months.
+- **No JSON parsing** (`metadata` etc.): Trino timed out on JSON functions at
+  this volume (~1M rows a month). `target` is the pass-through's `host:port`
+  from `api_base`, else `model_group`.
+
+| bucket | Rows |
+|---|---|
+| `model` | every other non-empty `call_type` (`acompletion`, `aresponses`, `anthropic_messages`, `aspeech`, …) |
+| `mcp` | `call_mcp_tool`, `list_mcp_tools` |
+| `a2a` | `asend_message`, `send_message` (LiteLLM 1.95.0's A2A call types) |
+| `pass-through: job status` | `pass_through_endpoint` to `…/jobs/<id>` or `…/jobs/<id>/progress`, any query string: the `GET` status polls **and the one `DELETE /jobs/{id}` per job** — the method is not logged |
+| `pass-through: other` | every other pass-through call, `…/jobs/<id>/artifacts/…` downloads included |
+| `other` | empty `call_type` (so far only failures, so none) |
+
+For scale, October 2026: 867,660 SGRs — `pass-through: job status` 650,896
+(41,038 classifier jobs), `pass-through: other` 208,832 (165,283 of them
+classifier artifact downloads), `model` 6,846, `mcp` 1,086.
+
+### How it is provisioned
+
+The image's `CMD` runs `superset/bootstrap.sh` before gunicorn on every start
+(apache/superset's own `CMD` only starts gunicorn), and Superset starts
+whether or not it succeeds. After registering the `trino` connection it runs
+`superset/provision_sgr.py`:
+
+| Object | Source | On every start |
+|---|---|---|
+| Virtual dataset `litellm_sgr_monthly` on `trino` | SQL: `superset/assets/litellm_sgr_monthly.sql`; columns: `COLUMNS` in `superset/sgr_spec.py` | SQL and columns re-synced from the repo; edits made in the UI are overwritten |
+| Charts **LiteLLM SGRs per month** / **by month and bucket**, dashboard **LiteLLM SGRs** | `superset/sgr_spec.py`, fixed UUIDs | created only when missing, never updated, so edits made in the UI survive |
+
+The provisioner never fails the boot: each step commits or rolls back on its
+own and logs, under `[provision_sgr]` (`make logs trino superset`). It does
+not run the SQL; the columns' types are the ones Superset records when it
+syncs them from Trino. To get a shipped chart or the dashboard back, delete
+it in the UI and restart.
+
+### Changing it
+
+1. Edit the SQL — one `SELECT`, no `;`, `%` or Jinja braces — and, if its
+   columns or buckets change, `COLUMNS` / `BUCKETS` / `BUCKET_COLORS` in
+   `superset/sgr_spec.py`.
+2. Run it through the Trino MCP's `run_query`, then
+   `UV_LINK_MODE=copy uv run --no-sync python -m pytest unit-tests/trino -q -p no:cacheprovider`
+   (columns, buckets, chart params and the image wiring in step).
+3. `make build trino superset && make up trino superset` (swap: the new copy
+   provisions before it turns healthy).
+
+A chart-param or layout change in `sgr_spec.py` only reaches an object that
+does not exist yet: delete that chart or the dashboard in the UI first.
 
 ## Object store: RustFS
 
@@ -654,7 +840,7 @@ integrity, serde info shape); a manual UPDATE will silently break
   in the `trino_auth` volume with a CA-issued key+cert PEM when there is
   a stable hostname for the box.
 - **Per-catalog access control** — every `TRINO_JDBC_USERS` login and
-  `trino-mcp` can read every catalog, including Phoenix production and
+  `trino-mcp` can read every catalog, including Phoenix production / staging and
   the Supabase projects. Trino's file-based access control
   (`access-control.name=file` + a `rules.json` mapping users/groups to
   catalogs and schemas) is the cheap fix once some sources need to be

@@ -10,6 +10,17 @@ and a sync route just calls the sync registry directly.
 We build two internal router variants (sync and async) and pick based on
 whether the registry's ``get`` method is a coroutine function.
 
+Long-poll (opt-in, async registries only): built with ``terminal_phases``,
+``GET {prefix}/{job_id}`` takes ``?wait=<seconds>`` and holds the request
+until the job reaches one of those phases or the wait runs out, re-reading the
+row every ``wait_check_interval_s`` — so a caller waiting on a job makes one
+or two requests instead of one every second or two. The re-reads are cheap
+primary-key reads inside the service; through a metered gateway (LiteLLM's
+``/v1/classifier`` pass-through) only the one outer request counts. Built
+without ``terminal_phases`` the route is exactly what it was, and FastAPI
+ignores a ``?wait=`` it does not declare — a client that sends it to such a
+router gets an immediate answer.
+
 ``build_progress_router`` is the separate, opt-in ``GET /jobs/{job_id}/progress``
 for a service whose jobs carry a ``common.jobs.progress.ProgressGauge``: the
 snapshot from the job row plus a page of the history a
@@ -21,11 +32,14 @@ just skip importing this module.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
-from typing import Any, Callable, Optional
+import math
+import time
+from typing import Any, Callable, Iterable, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from .model import JobBase, JobsListResponse
 
@@ -40,19 +54,32 @@ def build_router(
     include_cancel: bool = False,
     include_delete: bool = False,
     on_delete: Optional[Callable[[str], Any]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
+    terminal_phases: Optional[Iterable[str]] = None,
+    max_wait_s: float = 60.0,
+    wait_check_interval_s: float = 0.5,
 ) -> APIRouter:
     """Return a FastAPI ``APIRouter`` exposing standard jobs endpoints.
 
     Endpoints:
         ``GET  {prefix}``              — list active jobs (JobsListResponse).
-        ``GET  {prefix}/{job_id}``     — one job's snapshot (JobBase), 404 if unknown.
-        ``POST {prefix}/{job_id}/cancel`` — only if ``include_cancel=True``.
+        ``GET  {prefix}/{job_id}``     — one job's snapshot (JobBase), 404 if unknown;
+                                         ``?wait=`` with ``terminal_phases`` (below).
+        ``POST {prefix}/{job_id}/cancel`` — only if ``include_cancel=True``:
+                                         200 ``{job_id, cancelled: true, was_phase}``,
+                                         404 for an unknown job, 409
+                                         ``already_<phase>`` for a finished one.
         ``DELETE {prefix}/{job_id}``   — only if ``include_delete=True``.
 
     ``include_cancel`` and ``include_delete`` default to ``False`` so
     consumers opt in. Interceptor-api mounts with ``include_cancel=True``
-    (operators can abort a stuck capture); classifier mounts with
-    ``include_delete=True`` (its jobs persist and need explicit cleanup).
+    (operators can abort a stuck capture; its in-memory registry signals the
+    capture thread). The classifier mounts both: ``include_delete=True`` (its
+    jobs persist and need explicit cleanup) and ``include_cancel=True`` — a
+    persistent registry's cancel only flips the phase, and what stops the
+    running job is its ``WorkerPool``, built with ``cancel_check_interval``.
+    Mount the cancel route over a persistent registry only with such a pool:
+    with a plain one the job runs on and its result overwrites the cancel.
 
     ``on_delete`` is called with the job id **before** the row is deleted, so
     a consumer can clean up whatever it hangs off a job — the classifier uses
@@ -62,27 +89,92 @@ def build_router(
     swallowed: side-cleanup that throws must not turn a successful delete
     into a 500, and the row is the thing the caller asked to be gone.
 
+    ``on_cancel`` is called with ``(job_id, was_phase)`` **after** a
+    successful cancel (never for a 404 or a 409), so a consumer can clean up
+    a job no worker owns — the classifier finishes a ``staging`` /
+    ``pending`` job there and leaves a ``processing`` one to its pool. Sync
+    or async and swallowed on failure exactly like ``on_delete``: the cancel
+    already happened, and the answer says so.
+
+    ``terminal_phases`` turns on the long-poll: ``GET {prefix}/{job_id}``
+    then takes ``wait`` (query, seconds, default 0, ``>= 0``; above
+    ``max_wait_s`` it is clamped, not refused). With ``wait > 0`` and the job
+    not yet in one of ``terminal_phases``, the route re-reads the job every
+    ``wait_check_interval_s`` — never sleeping past the deadline — until its
+    phase is terminal or the wait is used up, then answers with the latest
+    snapshot: the same ``JobBase`` and the same 200 either way, so the caller
+    reads ``phase`` exactly as before. A job deleted mid-wait is a 404; a
+    client that disconnects ends the wait early. No connection is held while
+    it sleeps (each read borrows one and gives it back). Only for an async
+    registry — a sync route would hold a threadpool thread for the whole
+    wait, so ``terminal_phases`` with a sync registry is a ``ValueError``.
+    ``max_wait_s`` is the service's cap: below every proxy timeout in front of
+    it. Without ``terminal_phases`` neither knob is read and the route is
+    unchanged.
+
     The factory auto-detects sync vs async by inspecting ``registry.get``.
     """
     router = APIRouter(prefix=prefix, tags=tags or ["jobs"])
     is_async = inspect.iscoroutinefunction(registry.get)
+    long_poll = _long_poll_settings(
+        terminal_phases, max_wait_s, wait_check_interval_s, is_async=is_async
+    )
 
     if is_async:
-        _register_async(router, registry, include_cancel, include_delete, on_delete)
+        _register_async(
+            router, registry, include_cancel, include_delete, on_delete, long_poll,
+            on_cancel,
+        )
     else:
-        _register_sync(router, registry, include_cancel, include_delete, on_delete)
+        _register_sync(
+            router, registry, include_cancel, include_delete, on_delete, on_cancel
+        )
 
     return router
 
 
-def _run_delete_hook_sync(on_delete: Optional[Callable[[str], Any]], job_id: str) -> None:
-    """Invoke a sync ``on_delete`` hook, never raising."""
-    if on_delete is None:
+def _long_poll_settings(
+    terminal_phases: Optional[Iterable[str]],
+    max_wait_s: float,
+    wait_check_interval_s: float,
+    *,
+    is_async: bool,
+) -> Optional[tuple[frozenset[str], float, float]]:
+    """``(terminal phases, max wait, check interval)``, or None for no
+    long-poll. Refuses what would make a wait never end or block a thread."""
+    if terminal_phases is None:
+        return None
+    if isinstance(terminal_phases, str):
+        # A bare string would iterate into one-letter "phases".
+        raise TypeError("terminal_phases takes a collection of phase names, not one string")
+    phases = frozenset(terminal_phases)
+    if not phases:
+        raise ValueError("terminal_phases names no phase: every wait would run to its cap")
+    if not is_async:
+        raise ValueError(
+            "terminal_phases needs an async registry: a sync route would hold a "
+            "threadpool thread for the whole wait"
+        )
+    if not (math.isfinite(max_wait_s) and max_wait_s >= 0):
+        raise ValueError(f"max_wait_s must be a finite number >= 0, not {max_wait_s!r}")
+    if not (math.isfinite(wait_check_interval_s) and wait_check_interval_s > 0):
+        raise ValueError(
+            f"wait_check_interval_s must be a finite number > 0, not {wait_check_interval_s!r}"
+        )
+    return phases, float(max_wait_s), float(wait_check_interval_s)
+
+
+def _run_hook_sync(
+    hook: Optional[Callable[..., Any]], name: str, job_id: str, *args: Any
+) -> None:
+    """Invoke a sync ``on_delete`` / ``on_cancel`` hook with ``(job_id,
+    *args)``, never raising."""
+    if hook is None:
         return
     try:
-        result = on_delete(job_id)
+        result = hook(job_id, *args)
     except Exception as exc:
-        _log.warning("on_delete hook failed for job %s: %s", job_id, exc)
+        _log.warning("%s hook failed for job %s: %s", name, job_id, exc)
         return
     if inspect.isawaitable(result):
         # A sync route has no event loop to await in. Close the coroutine so
@@ -90,24 +182,26 @@ def _run_delete_hook_sync(on_delete: Optional[Callable[[str], Any]], job_id: str
         # what the consumer has to fix.
         getattr(result, "close", lambda: None)()
         _log.warning(
-            "on_delete hook for job %s returned an awaitable, but this router "
+            "%s hook for job %s returned an awaitable, but this router "
             "was built for a SYNC registry — pass a sync callable",
+            name,
             job_id,
         )
 
 
-async def _run_delete_hook_async(
-    on_delete: Optional[Callable[[str], Any]], job_id: str
+async def _run_hook_async(
+    hook: Optional[Callable[..., Any]], name: str, job_id: str, *args: Any
 ) -> None:
-    """Invoke a sync-or-async ``on_delete`` hook, never raising."""
-    if on_delete is None:
+    """Invoke a sync-or-async ``on_delete`` / ``on_cancel`` hook with
+    ``(job_id, *args)``, never raising."""
+    if hook is None:
         return
     try:
-        result = on_delete(job_id)
+        result = hook(job_id, *args)
         if inspect.isawaitable(result):
             await result
     except Exception as exc:
-        _log.warning("on_delete hook failed for job %s: %s", job_id, exc)
+        _log.warning("%s hook failed for job %s: %s", name, job_id, exc)
 
 
 def _register_sync(
@@ -116,6 +210,7 @@ def _register_sync(
     include_cancel: bool,
     include_delete: bool,
     on_delete: Optional[Callable[[str], Any]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
 ) -> None:
     @router.get("", response_model=JobsListResponse)
     def list_jobs() -> JobsListResponse:
@@ -141,6 +236,7 @@ def _register_sync(
                     status_code=409,
                     detail=f"cannot cancel {job_id!r}: {phase_or_reason}",
                 )
+            _run_hook_sync(on_cancel, "on_cancel", job_id, phase_or_reason)
             return {
                 "job_id": job_id,
                 "cancelled": True,
@@ -150,7 +246,7 @@ def _register_sync(
     if include_delete:
         @router.delete("/{job_id}", status_code=204)
         def delete_job(job_id: str) -> None:
-            _run_delete_hook_sync(on_delete, job_id)
+            _run_hook_sync(on_delete, "on_delete", job_id)
             if not registry.delete(job_id):
                 raise HTTPException(
                     status_code=404, detail=f"no job {job_id!r}"
@@ -163,17 +259,22 @@ def _register_async(
     include_cancel: bool,
     include_delete: bool,
     on_delete: Optional[Callable[[str], Any]] = None,
+    long_poll: Optional[tuple[frozenset[str], float, float]] = None,
+    on_cancel: Optional[Callable[[str, str], Any]] = None,
 ) -> None:
     @router.get("", response_model=JobsListResponse)
     async def list_jobs() -> JobsListResponse:
         return await registry.list_all()
 
-    @router.get("/{job_id}", response_model=JobBase)
-    async def get_job(job_id: str) -> JobBase:
-        job = await registry.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
-        return job
+    if long_poll is None:
+        @router.get("/{job_id}", response_model=JobBase)
+        async def get_job(job_id: str) -> JobBase:
+            job = await registry.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+            return job
+    else:
+        _add_long_poll_get(router, registry, *long_poll)
 
     if include_cancel:
         @router.post("/{job_id}/cancel")
@@ -188,6 +289,7 @@ def _register_async(
                     status_code=409,
                     detail=f"cannot cancel {job_id!r}: {phase_or_reason}",
                 )
+            await _run_hook_async(on_cancel, "on_cancel", job_id, phase_or_reason)
             return {
                 "job_id": job_id,
                 "cancelled": True,
@@ -197,11 +299,54 @@ def _register_async(
     if include_delete:
         @router.delete("/{job_id}", status_code=204)
         async def delete_job(job_id: str) -> None:
-            await _run_delete_hook_async(on_delete, job_id)
+            await _run_hook_async(on_delete, "on_delete", job_id)
             if not await registry.delete(job_id):
                 raise HTTPException(
                     status_code=404, detail=f"no job {job_id!r}"
                 )
+
+
+def _add_long_poll_get(
+    router: APIRouter,
+    registry: Any,
+    terminal: frozenset[str],
+    max_wait_s: float,
+    check_interval_s: float,
+) -> None:
+    """``GET {prefix}/{job_id}`` with ``?wait=`` — see ``build_router``."""
+    phases = ", ".join(sorted(terminal))
+
+    @router.get("/{job_id}", response_model=JobBase)
+    async def get_job(
+        job_id: str,
+        request: Request,
+        wait: float = Query(
+            0.0,
+            ge=0,
+            # NaN would compare false against every deadline and wait forever.
+            allow_inf_nan=False,
+            description=(
+                f"Seconds to hold the request until the job's phase is terminal "
+                f"({phases}); clamped to {max_wait_s:g}. 0 answers at once."
+            ),
+        ),
+    ) -> JobBase:
+        job = await registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+        deadline = time.monotonic() + min(wait, max_wait_s)
+        while job.phase not in terminal:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(check_interval_s, remaining))
+            if await request.is_disconnected():
+                # Nobody is left to read the answer; stop re-reading the row.
+                break
+            job = await registry.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"no job {job_id!r}")
+        return job
 
 
 # ── Progress ──────────────────────────────────────────────────────────────

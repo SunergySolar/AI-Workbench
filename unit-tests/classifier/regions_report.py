@@ -93,6 +93,7 @@ if _COMMON_SRC.is_dir() and str(_COMMON_SRC) not in sys.path:
     sys.path.insert(0, str(_COMMON_SRC))
 
 from common.env import load_env  # noqa: E402
+from common.net import retry_after_s  # noqa: E402
 from common.vision import (  # noqa: E402
     PageGeometry,
     Region,
@@ -143,8 +144,26 @@ ARTIFACT_PATTERNS = (
 # from the result's ``artifacts.layers``, whenever the page had an image.
 LAYERS_TO_FETCH = ("svg", "preview")
 
+# Each GET /jobs/{id} long-polls: ``?wait=`` holds it in the service until
+# the job ends or POLL_WAIT_S passes (the service caps a wait at 60 s,
+# ai/classifier/API.md § GET /jobs/{job_id}), so a job costs one or two
+# requests — through LiteLLM each one is a metered call. Under HttpTransport's
+# 120 s read timeout. A classifier older than the long-poll ignores ``wait``
+# and answers at once: a non-terminal answer back in under FAST_ANSWER_S is
+# followed by the old POLL_INTERVAL_S sleep, so the loop never spins.
+POLL_WAIT_S = 30.0
+FAST_ANSWER_S = 1.0
 POLL_INTERVAL_S = 1.5
 TERMINAL_PHASES = ("completed", "failed", "cancelled")
+
+# POST /assess answers 429 + Retry-After while the classifier's queue is at
+# CLASSIFIER_QUEUE_LIMIT (ai/classifier/API.md § Concurrency and
+# durability); :func:`submit` waits that long and resubmits — at most
+# QUEUE_FULL_RETRY_MAX_S per sleep, QUEUE_FULL_WAIT_S in all per case —
+# rather than recording the case as refused.
+QUEUE_FULL_WAIT_S = 600.0
+QUEUE_FULL_RETRY_DEFAULT_S = 10.0
+QUEUE_FULL_RETRY_MAX_S = 60.0
 
 # Suffixes we know how to re-render a page image from. Anything else (.txt,
 # .docx) has no pixel space, which the report states rather than hides.
@@ -554,7 +573,28 @@ def _needs_remote(criterion: dict) -> bool:
 
 
 def submit(case: Case, transport: Any) -> Any:
-    """POST the case, returning the raw response."""
+    """POST the case, returning the raw response — after waiting out a full
+    queue: while the classifier is at its CLASSIFIER_QUEUE_LIMIT a submit
+    answers 429 + Retry-After (no job created), so sleep that long
+    (``common.net.retry_after_s``: seconds or an HTTP-date,
+    QUEUE_FULL_RETRY_DEFAULT_S without one, at most QUEUE_FULL_RETRY_MAX_S)
+    and resubmit, printing a line each time, for up to QUEUE_FULL_WAIT_S. A
+    429 still standing after that is returned like any other refusal."""
+    deadline = time.monotonic() + QUEUE_FULL_WAIT_S
+    while True:
+        response = _post_case(case, transport)
+        left = deadline - time.monotonic()
+        if response.status_code != 429 or left <= 0:
+            return response
+        delay = min(left, retry_after_s(response.headers.get("Retry-After"),
+                                        default=QUEUE_FULL_RETRY_DEFAULT_S,
+                                        cap=QUEUE_FULL_RETRY_MAX_S))
+        print(f"  {case.name}: the classifier queue is full (429) — resubmitting in {delay:.0f} s")
+        time.sleep(delay)
+
+
+def _post_case(case: Case, transport: Any) -> Any:
+    """One POST of the case (the files are re-read each time)."""
     if case.json_body is not None:
         return transport.request(
             "POST", case.path, json=case.json_body, headers=case.headers
@@ -576,11 +616,16 @@ def submit(case: Case, transport: Any) -> Any:
 
 
 def poll(transport: Any, job_id: str, timeout_s: float) -> dict:
-    """Poll ``GET /jobs/{id}`` until the phase is terminal or time runs out."""
+    """Poll ``GET /jobs/{id}`` until the phase is terminal or time runs out —
+    each request a long-poll of up to POLL_WAIT_S (see the constants)."""
     deadline = time.monotonic() + timeout_s
     job: dict = {}
-    while time.monotonic() < deadline:
-        response = transport.request("GET", f"/v1/classifier/jobs/{job_id}")
+    while (remaining := deadline - time.monotonic()) > 0:
+        asked = time.monotonic()
+        response = transport.request(
+            "GET", f"/v1/classifier/jobs/{job_id}",
+            params={"wait": round(min(POLL_WAIT_S, remaining), 1)},
+        )
         if response.status_code != 200:
             raise RuntimeError(
                 f"GET /jobs/{job_id} returned {response.status_code}: {response.text[:300]}"
@@ -588,7 +633,8 @@ def poll(transport: Any, job_id: str, timeout_s: float) -> dict:
         job = response.json()
         if job.get("phase") in TERMINAL_PHASES:
             return job
-        time.sleep(POLL_INTERVAL_S)
+        if time.monotonic() - asked < FAST_ANSWER_S:
+            time.sleep(POLL_INTERVAL_S)
     job.setdefault("phase", "timeout")
     job["error"] = f"still {job.get('phase')} after {timeout_s:.0f}s"
     return job

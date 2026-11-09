@@ -149,6 +149,12 @@ runs IN THE SERVICE with the SERVICE's settings: an env knob such as
 ``CLASSIFIER_LLM_BBOX_MARKS_MAX`` is the classifier container's (its ``.env``
 and ``make up classifier``), never this process's.
 
+A full queue does not end a run: while the service is at its
+``CLASSIFIER_QUEUE_LIMIT`` a submit answers 429 + ``Retry-After``, and every
+``POST /assess`` / ``POST /references`` here waits that long and resubmits
+(a line printed each time), for up to ten minutes per submit
+(``QUEUE_FULL_WAIT_S``).
+
 What it prints, per criterion: runs; for pairs with truth boxes the hit rate
 and false accepts (accepted, not a hit); for ``absent`` pairs the correct
 rate (nothing accepted) and wrong accepts; where wrong boxes landed; how often
@@ -166,8 +172,9 @@ Process flow position: none — a standalone operator tool, an HTTP client of
 the running service. It imports ``grounding_experiment`` for the truth
 format, the picks and the scoring (so both measure the same way),
 ``api.schemas`` only to check the locate criteria before anything is
-created, and ``common.documents.pdf_page_count`` only to check
-``--pdf-dir``'s PDFs are one page each.
+created, ``common.documents.pdf_page_count`` only to check
+``--pdf-dir``'s PDFs are one page each, and ``common.net.retry_after_s`` to
+read a 429's ``Retry-After``.
 """
 
 from __future__ import annotations
@@ -180,6 +187,8 @@ import sys
 import time
 import zlib
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -189,6 +198,7 @@ for _path in (str(_BIN.parent), str(_BIN)):
         sys.path.insert(0, _path)
 
 import grounding_experiment as ge  # noqa: E402
+from common.net import retry_after_s  # noqa: E402
 from common.vision import PageGeometry  # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
@@ -216,6 +226,29 @@ NO_FAIL_REFERENCE = (
 )
 # The loop's own sentence for "the model answered bbox: null".
 _BBOX_NULL = "you answered bbox: null"
+# GET /jobs/{id} long-polls (``?wait=``, API.md § GET /jobs/{job_id}): the
+# service holds each request until the job ends or JOB_WAIT_S passes (it caps
+# a wait at 60 s; the client's 300 s timeout is far above). Each job in flight
+# is waited on in its own thread, so a job is seen the moment it ends —
+# ``job_seconds`` stays as exact as before — at one or two requests per job
+# instead of one per ``--poll``. A classifier that predates ``wait`` answers
+# at once: a non-terminal answer back in under FAST_ANSWER_S is followed by a
+# ``--poll`` sleep, so a waiter never spins.
+JOB_WAIT_S = 30.0
+FAST_ANSWER_S = 1.0
+# Every phase a job ends in — the service's own terminal tuple (a job someone
+# cancels with POST /jobs/{id}/cancel ends "cancelled").
+JOB_TERMINAL = ("completed", "failed", "cancelled")
+# POST /assess and POST /references answer 429 + Retry-After while the
+# service's queue is at CLASSIFIER_QUEUE_LIMIT (API.md § Concurrency and
+# durability) — no job was created. Every submit here waits that long and
+# resubmits (``_post_admitted``), at most QUEUE_FULL_RETRY_MAX_S per sleep
+# and QUEUE_FULL_WAIT_S in all for one submit; past that the 429 is handled
+# like any refusal (the run stops on an /assess, the reference is failed).
+# Without it one 429 ended a long run (``_check`` exits on any status ≥ 300).
+QUEUE_FULL_WAIT_S = 600.0
+QUEUE_FULL_RETRY_DEFAULT_S = 10.0
+QUEUE_FULL_RETRY_MAX_S = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -676,8 +709,8 @@ def job_records(job: JobSpec, result: dict, truth: dict[str, ge.Truth],
 
 
 def failed_job_records(job: JobSpec, why: str, keys: dict[str, str], config: str) -> list[dict]:
-    """The records of a job that never produced a result (failed, timed
-    out): every criterion ``status: job_<why>``, nothing accepted."""
+    """The records of a job that never produced a result (failed, cancelled,
+    timed out): every criterion ``status: job_<why>``, nothing accepted."""
     return [{
         "image": job.page, "page_id": page_id(job.page), "criterion": label,
         "key": keys.get(label), "repeat": job.repeat, "config": config, "job_id": job.job_id,
@@ -712,7 +745,8 @@ def summarise(records: list[dict]) -> dict:
             "sent_as": dict(sorted(Counter(r.get("sent_as") or "image" for r in rows).items())),
             "errors": sum(1 for r in rows if r.get("status") != "ok"),
             # A unit's error kind, or the status itself for a job that never
-            # finished (job_failed, job_timed_out) or a missing entry.
+            # finished (job_failed, job_cancelled, job_timed_out) or a
+            # missing entry.
             "error_kinds": dict(Counter(r.get("error_kind") or r.get("status")
                                         for r in rows if r.get("status") != "ok")),
             "loop_ran_rate": round(ge._rate([r.get("loop_ran") for r in rows]), 3),
@@ -830,6 +864,26 @@ def _check(response, what: str) -> dict:
             detail = response.text[:300]
         raise SystemExit(f"{what}: HTTP {response.status_code}: {str(detail)[:400]}")
     return response.json() if response.content else {}
+
+
+def _post_admitted(client: Any, path: str, what: str, **kwargs: Any):
+    """``client.post(path, **kwargs)``, waiting out a full queue: on a 429
+    sleep its ``Retry-After`` (``common.net.retry_after_s`` — seconds or an
+    HTTP-date; QUEUE_FULL_RETRY_DEFAULT_S without one, at most
+    QUEUE_FULL_RETRY_MAX_S) and resubmit, printing a line each time, until
+    QUEUE_FULL_WAIT_S have passed. Returns the last response — a 429 still,
+    once the wait is spent; the caller treats it as any refusal."""
+    deadline = time.monotonic() + QUEUE_FULL_WAIT_S
+    while True:
+        response = client.post(path, **kwargs)
+        left = deadline - time.monotonic()
+        if response.status_code != 429 or left <= 0:
+            return response
+        delay = min(left, retry_after_s(response.headers.get("Retry-After"),
+                                        default=QUEUE_FULL_RETRY_DEFAULT_S,
+                                        cap=QUEUE_FULL_RETRY_MAX_S))
+        print(f"  {what}: the classifier queue is full (429) — resubmitting in {delay:.0f} s")
+        time.sleep(delay)
 
 
 def _validate_criteria(criteria: list[dict], references: bool) -> None:
@@ -986,8 +1040,8 @@ def create_references(client: Any, state: Run, images: dict[str, pathlib.Path],
             raw = raws[spec.page] = images[spec.page].read_bytes()
             if len(raws) > 4:           # keep a few pages in memory, not the set
                 raws.pop(next(iter(raws)))
-        response = client.post(
-            "/references",
+        response = _post_admitted(
+            client, "/references", f"POST /references ({page_id(spec.page)})",
             data=reference_form(spec, keys.get(spec.criterion), image_size(raw)),
             files={"file": (spec.page, raw, _content_type(spec.page))},
         )
@@ -1024,51 +1078,82 @@ def run_jobs(client: Any, state: Run, args: argparse.Namespace,
              images: dict[str, pathlib.Path], truth: dict[str, ge.Truth],
              keys: dict[str, str], overlays: dict[str, dict], config: str,
              *, pdfs: Optional[dict[str, pathlib.Path]] = None) -> None:
-    """At most ``--concurrency`` jobs in flight: submit, poll, and as each
-    finishes score it, write ``--out``, then delete the job. A job
+    """At most ``--concurrency`` jobs in flight: submit, wait (one waiter
+    thread per job, ``wait_for_job``), and as each finishes score it, write
+    ``--out``, then delete the job — all on this thread. A job
     ``sent_as: "pdf"`` uploads ``pdfs[page]`` instead of the image, and is
     scored against the image's size (``image_size``, read once per page)."""
     pdfs = pdfs or {}
     truth_sizes: dict[str, tuple[int, int]] = {}
     queue = list(state.jobs)
-    flying: list[JobSpec] = []
+    flying: dict[Future, JobSpec] = {}
     done = 0
-    while queue or flying:
-        while queue and len(flying) < args.concurrency:
-            job = queue.pop(0)
-            source = pdfs[job.page] if job.sent_as == "pdf" else images[job.page]
-            raw = source.read_bytes()
-            if job.sent_as == "pdf" and job.page not in truth_sizes:
-                truth_sizes[job.page] = image_size(images[job.page].read_bytes())
-            body = _check(
-                client.post("/assess", data=job_form(job, keys, overlays, args.model),
-                            files={"file": (source.name, raw, _content_type(source.name))}),
-                f"POST /assess ({page_id(job.page)} #{job.repeat})",
-            )
-            job.job_id, job.submitted_at = body["job_id"], time.monotonic()
-            flying.append(job)
+    waiters = ThreadPoolExecutor(max_workers=args.concurrency, thread_name_prefix="job-wait")
+    try:
+        while queue or flying:
+            while queue and len(flying) < args.concurrency:
+                job = queue.pop(0)
+                source = pdfs[job.page] if job.sent_as == "pdf" else images[job.page]
+                raw = source.read_bytes()
+                if job.sent_as == "pdf" and job.page not in truth_sizes:
+                    truth_sizes[job.page] = image_size(images[job.page].read_bytes())
+                what = f"POST /assess ({page_id(job.page)} #{job.repeat})"
+                body = _check(
+                    _post_admitted(client, "/assess", what,
+                                   data=job_form(job, keys, overlays, args.model),
+                                   files={"file": (source.name, raw, _content_type(source.name))}),
+                    what,
+                )
+                job.job_id, job.submitted_at = body["job_id"], time.monotonic()
+                flying[waiters.submit(wait_for_job, client, job, args)] = job
+            finished, _ = wait_futures(flying, return_when=FIRST_COMPLETED)
+            # In submission order, so the records' order does not depend on
+            # which waiter thread happened to return first.
+            for future in [f for f in flying if f in finished]:
+                job = flying.pop(future)
+                body, answered = future.result()   # a waiter's error is raised here
+                phase = body.get("phase")
+                seconds = round(answered - (job.submitted_at or 0), 1)
+                if phase == "completed":
+                    records = job_records(job, body.get("result") or {}, truth, keys, config,
+                                          truth_size=truth_sizes.get(job.page))
+                elif phase in ("failed", "cancelled"):
+                    # cancelled: someone stopped it (POST /jobs/{id}/cancel).
+                    # Terminal — a wait on it answers at once, so it is never
+                    # waited on again.
+                    records = failed_job_records(job, phase, keys, config)
+                elif seconds > args.timeout:
+                    records = failed_job_records(job, "timed_out", keys, config)
+                else:
+                    flying[waiters.submit(wait_for_job, client, job, args)] = job
+                    continue
+                for record in records:
+                    record["job_seconds"] = seconds
+                state.records.extend(records)
+                done += 1
+                write_out(args, state, config)
+                _delete_job(client, state, job.job_id)
+                print(f"  job {done}/{len(state.jobs)} {job.job_id} {phase}")
+    finally:
+        # Never block on a waiter still out (an error, Ctrl-C): ``cleanup``
+        # deletes its job next, and the service answers a wait on a deleted
+        # job with a 404 within a second, which ends the thread.
+        waiters.shutdown(wait=False, cancel_futures=True)
+
+
+def wait_for_job(client: Any, job: JobSpec, args: argparse.Namespace) -> tuple[dict, float]:
+    """One long-poll of ``GET /jobs/{id}``, on a waiter thread: the body and
+    when it came back (``time.monotonic``). The wait is cut to what is left of
+    ``--timeout``; see JOB_WAIT_S for the fallback sleep."""
+    left = args.timeout - (time.monotonic() - (job.submitted_at or 0))
+    asked = time.monotonic()
+    body = _check(client.get(f"/jobs/{job.job_id}",
+                             params={"wait": round(min(JOB_WAIT_S, max(0.0, left)), 1)}),
+                  f"GET /jobs/{job.job_id}")
+    answered = time.monotonic()
+    if body.get("phase") not in JOB_TERMINAL and answered - asked < FAST_ANSWER_S:
         time.sleep(args.poll)
-        for job in list(flying):
-            body = _check(client.get(f"/jobs/{job.job_id}"), f"GET /jobs/{job.job_id}")
-            phase = body.get("phase")
-            seconds = round(time.monotonic() - (job.submitted_at or 0), 1)
-            if phase == "completed":
-                records = job_records(job, body.get("result") or {}, truth, keys, config,
-                                      truth_size=truth_sizes.get(job.page))
-            elif phase == "failed":
-                records = failed_job_records(job, "failed", keys, config)
-            elif seconds > args.timeout:
-                records = failed_job_records(job, "timed_out", keys, config)
-            else:
-                continue
-            for record in records:
-                record["job_seconds"] = seconds
-            state.records.extend(records)
-            flying.remove(job)
-            done += 1
-            write_out(args, state, config)
-            _delete_job(client, state, job.job_id)
-            print(f"  job {done}/{len(state.jobs)} {job.job_id} {phase}")
+    return body, answered
 
 
 def _content_type(name: str) -> str:
@@ -1212,7 +1297,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None,
                         help="the job's registry model (default: the service's default)")
     parser.add_argument("--concurrency", type=int, default=4, help="jobs in flight (default 4)")
-    parser.add_argument("--poll", type=float, default=2.0, help="poll interval, seconds")
+    parser.add_argument("--poll", type=float, default=2.0,
+                        help="seconds between job polls when the classifier answers a "
+                             "GET /jobs/{id}?wait= at once (one older than the long-poll); "
+                             "also the references' poll interval (default 2)")
     parser.add_argument("--timeout", type=float, default=1800.0,
                         help="seconds one job (or the references) may take (default 1800)")
     parser.add_argument("--out", default=None, help="write the records and summary here")
